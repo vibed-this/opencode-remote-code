@@ -1,9 +1,9 @@
 import fs from "fs/promises"
 import path from "path"
-import { tool } from "@opencode-ai/plugin"
 import type { PathMapper } from "../path-mapper.js"
 import type { SSHPool } from "../ssh-pool.js"
 import type { SyncEngine } from "../sync-engine.js"
+import type { PermissionGateway, RemoteToolDefinition } from "../v2-bridge.js"
 
 
 const DEFAULT_LIMIT = 2000
@@ -56,13 +56,33 @@ async function checkRemoteBinary(
   return { isBinary: false }
 }
 
-export function createReadTool(pathMapper: PathMapper, syncEngine: SyncEngine, sshPool: SSHPool) {
-  return tool({
+export function createReadTool(
+  pathMapper: PathMapper,
+  syncEngine: SyncEngine,
+  sshPool: SSHPool,
+  permission: PermissionGateway
+): RemoteToolDefinition {
+  return {
+    name: "read",
     description: `Read the contents of a file or list a directory on the remote machine.`,
-    args: {
-      filePath: tool.schema.string().describe("The absolute path to the file or directory to read"),
-      offset: tool.schema.number().optional().describe("The line number to start reading from (1-indexed)"),
-      limit: tool.schema.number().optional().describe("The maximum number of lines to read (defaults to 2000)"),
+    input: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          description: "The absolute path to the file or directory to read",
+        },
+        offset: {
+          type: "number",
+          description: "The line number to start reading from (1-indexed)",
+        },
+        limit: {
+          type: "number",
+          description: "The maximum number of lines to read (defaults to 2000)",
+        },
+      },
+      required: ["filePath"],
+      additionalProperties: false,
     },
     async execute(args, ctx) {
       let remotePath = path.posix.normalize(args.filePath)
@@ -70,10 +90,10 @@ export function createReadTool(pathMapper: PathMapper, syncEngine: SyncEngine, s
         remotePath = path.posix.join(pathMapper.remoteRoot, remotePath)
       }
       if (!pathMapper.isWithinWorkspace(remotePath)) {
-        await ctx.ask({
-          permission: "read",
-          patterns: [remotePath],
-          always: [remotePath],
+        await permission(ctx, {
+          action: "read",
+          resources: [remotePath],
+          save: [remotePath],
           metadata: {},
         })
       }
@@ -104,8 +124,7 @@ export function createReadTool(pathMapper: PathMapper, syncEngine: SyncEngine, s
         const truncated = start + sliced.length < items.length
 
         return {
-          title: remotePath,
-          output: [
+          content: [
             `<path>${remotePath}</path>`,
             `<type>directory</type>`,
             `<entries>`,
@@ -115,7 +134,11 @@ export function createReadTool(pathMapper: PathMapper, syncEngine: SyncEngine, s
               : `\n(${items.length} entries)`,
             `</entries>`,
           ].join("\n"),
-          metadata: { preview: sliced.slice(0, 20).join("\n"), truncated },
+          metadata: {
+            title: remotePath,
+            preview: sliced.slice(0, 20).join("\n"),
+            truncated,
+          },
         }
       }
 
@@ -201,15 +224,15 @@ export function createReadTool(pathMapper: PathMapper, syncEngine: SyncEngine, s
       output += "\n</content>"
 
       return {
-        title: remotePath,
-        output,
+        content: output,
         metadata: {
+          title: remotePath,
           preview: out.slice(0, 20).join("\n"),
           truncated: more || cut,
         },
       }
     },
-  })
+  }
 }
 
 function quoteShell(input: string): string {

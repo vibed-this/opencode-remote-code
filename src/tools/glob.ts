@@ -1,15 +1,24 @@
-import { tool } from "@opencode-ai/plugin"
 import type { RemoteConfig } from "../config.js"
 import type { SSHPool } from "../ssh-pool.js"
+import type { RemoteToolDefinition } from "../v2-bridge.js"
 
-export function createGlobTool(config: RemoteConfig, sshPool: SSHPool) {
-  return tool({
+export function createGlobTool(config: RemoteConfig, sshPool: SSHPool): RemoteToolDefinition {
+  return {
+    name: "glob",
     description: `Find files matching a glob pattern on the remote machine.`,
-    args: {
-      pattern: tool.schema.string().describe("The glob pattern to match files against"),
-      path: tool.schema.string().optional().describe("The directory to search in. Omit to use the default directory."),
+    input: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "The glob pattern to match files against" },
+        path: {
+          type: "string",
+          description: "The directory to search in. Omit to use the default directory.",
+        },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
     },
-    async execute(args, ctx) {
+    async execute(args, _ctx) {
       const searchDir = args.path || config.remoteWorkdir
       const limit = 100
 
@@ -56,15 +65,15 @@ export function createGlobTool(config: RemoteConfig, sshPool: SSHPool) {
       }
 
       return {
-        title: searchDir,
-        output: output.join("\n"),
+        content: output.join("\n"),
         metadata: {
+          title: searchDir,
           count: files.length,
           truncated,
         },
       }
     },
-  })
+  }
 }
 
 import { quoteShell } from "../shell-quote.js"

@@ -2,6 +2,15 @@
 
 [English](README.md)
 
+> **⚠️ 本分支面向 OpenCode V2（`@opencode/plugin` ^2.1.2）。**
+> 工具名改为 `shell` / `patch` / `read` / `write` / `edit` / `glob` / `grep`
+> （V1 的 `bash` / `apply_patch` 在 V2 中已不存在），远程模式改为在 `opencode.jsonc`
+> 的插件 `options` 里配置，而不是 `REMOTE_*` 环境变量——V2 的插件跑在后台共享服务里，
+> 继承不到你 shell 的环境变量。可用配置见 **[PORTING-NOTES.md](PORTING-NOTES.md)**，
+> 实测的 V1→V2 API 契约见 **[MIGRATION-V2.md](MIGRATION-V2.md)**。
+> 以下正文来自上游，描述的是 V1 的行为。
+> Fork 自 [zz6zz666/opencode-remote-code](https://github.com/zz6zz666/opencode-remote-code)。
+
 一款 OpenCode 插件，让 AI Agent 能够通过 SSH 直接操控远程机器——**远程端零依赖**，仅需 SSH 守护进程即可。无需在远程安装任何 agent、运行时或依赖。
 
 对 AI 而言，一切感知与本地无异：它调用的仍然是 `bash`、`edit`、`write`、`read`、`glob`、`grep` 和 `apply_patch`。

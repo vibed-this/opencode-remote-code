@@ -1,11 +1,11 @@
 import fs from "fs/promises"
 import path from "path"
-import { tool } from "@opencode-ai/plugin"
 import { createTwoFilesPatch, diffLines } from "diff"
 import type { PathMapper } from "../path-mapper.js"
 import type { SyncEngine } from "../sync-engine.js"
 import { readFileWithBom, joinBom, splitBom } from "../bom.js"
 import { trimDiff } from "../diff-utils.js"
+import type { PermissionGateway, RemoteToolDefinition } from "../v2-bridge.js"
 
 // ========================================================================
 // Per-file edit locks
@@ -397,14 +397,33 @@ function countDiffStats(oldText: string, newText: string): { additions: number; 
 // Tool definition
 // ========================================================================
 
-export function createEditTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
-  return tool({
+export function createEditTool(
+  pathMapper: PathMapper,
+  syncEngine: SyncEngine,
+  permission: PermissionGateway
+): RemoteToolDefinition {
+  return {
+    name: "edit",
     description: `Make precise text replacements in a remote file.`,
-    args: {
-      filePath: tool.schema.string().describe("The absolute path to the file to modify"),
-      oldString: tool.schema.string().describe("The text to replace"),
-      newString: tool.schema.string().describe("The text to replace it with (must be different from oldString)"),
-      replaceAll: tool.schema.boolean().optional().describe("Replace all occurrences of oldString (default false)"),
+    input: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          description: "The absolute path to the file to modify",
+        },
+        oldString: { type: "string", description: "The text to replace" },
+        newString: {
+          type: "string",
+          description: "The text to replace it with (must be different from oldString)",
+        },
+        replaceAll: {
+          type: "boolean",
+          description: "Replace all occurrences of oldString (default false)",
+        },
+      },
+      required: ["filePath", "oldString", "newString"],
+      additionalProperties: false,
     },
     async execute(args, ctx) {
       if (args.oldString === args.newString) {
@@ -416,10 +435,10 @@ export function createEditTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
         remotePath = path.posix.join(pathMapper.remoteRoot, remotePath)
       }
       if (!pathMapper.isWithinWorkspace(remotePath)) {
-        await ctx.ask({
-          permission: "edit",
-          patterns: [remotePath],
-          always: [remotePath],
+        await permission(ctx, {
+          action: "edit",
+          resources: [remotePath],
+          save: [remotePath],
           metadata: {},
         })
       }
@@ -453,10 +472,10 @@ export function createEditTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
 
         // Build diff preview for permission request
         const diffPreview = generateDiffPreview(remotePath, content, result)
-        await ctx.ask({
-          permission: "edit",
-          patterns: [remotePath],
-          always: [remotePath],
+        await permission(ctx, {
+          action: "edit",
+          resources: [remotePath],
+          save: [remotePath],
           metadata: { diff: diffPreview },
         })
 
@@ -468,9 +487,9 @@ export function createEditTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
         const stats = countDiffStats(content, result)
 
         return {
-          title: remotePath,
-          output: `Edit applied successfully.`,
+          content: `Edit applied successfully.`,
           metadata: {
+            title: remotePath,
             filepath: remotePath,
             additions: stats.additions,
             deletions: stats.deletions,
@@ -478,7 +497,7 @@ export function createEditTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
         }
       })
     },
-  })
+  }
 }
 
 function generateDiffPreview(filePath: string, oldText: string, newText: string): string {

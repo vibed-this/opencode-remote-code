@@ -32,6 +32,7 @@ import { createGrepTool } from "./tools/grep.js"
 import { createPatchTool } from "./tools/patch.js"
 import { createReadTool } from "./tools/read.js"
 import { createWriteTool } from "./tools/write.js"
+import type { PermissionGateway, ToolCallIdentity } from "./v2-bridge.js"
 
 // =============================================================================
 // Load .env.test (gitignored — never commit credentials)
@@ -85,24 +86,17 @@ function ensureEnv() {
 // =============================================================================
 
 function getOutput(result: any): string {
-  return typeof result === "string" ? result : result?.output ?? ""
+  return typeof result === "string" ? result : result?.content ?? ""
 }
+
+/** V2 permission gateway mock: allows everything, records nothing. */
+const mockPermission: PermissionGateway = async () => {}
 
 function mockCtx() {
   return {
-    sessionID: "test-session",
+    sessionID: "test-session" as ToolCallIdentity["sessionID"],
     messageID: "test-msg",
-    agent: "test-agent",
-    directory: "/mock/local",
-    worktree: "/mock/local",
-    abort: new AbortController().signal,
-    metadata: (_input: { title?: string; metadata?: Record<string, any> }) => {},
-    ask: async (_input: {
-      permission: string
-      patterns: string[]
-      always: string[]
-      metadata: Record<string, any>
-    }) => {},
+    id: "test-call",
   }
 }
 
@@ -284,12 +278,12 @@ async function main() {
   const manifest = new ManifestManager(pathMapper)
   await manifest.load()
   const syncEngine = new SyncEngine(config, pathMapper, manifest, sshPool!)
-  const readTool = createReadTool(pathMapper, syncEngine, sshPool!)
-  const writeTool = createWriteTool(pathMapper, syncEngine)
-  const editTool = createEditTool(pathMapper, syncEngine)
+  const readTool = createReadTool(pathMapper, syncEngine, sshPool!, mockPermission)
+  const writeTool = createWriteTool(pathMapper, syncEngine, mockPermission)
+  const editTool = createEditTool(pathMapper, syncEngine, mockPermission)
   const globTool = createGlobTool(config, sshPool!)
   const grepTool = createGrepTool(config, sshPool!)
-  const patchTool = createPatchTool(config, pathMapper, syncEngine, sshPool!)
+  const patchTool = createPatchTool(config, pathMapper, syncEngine, sshPool!, mockPermission)
 
   // Prepare remote test directory
   await setupTestDir(sshPool!, manifest, pathMapper)

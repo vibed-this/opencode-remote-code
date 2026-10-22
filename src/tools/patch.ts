@@ -1,12 +1,16 @@
 import fs from "fs/promises"
 import path from "path"
-import { tool } from "@opencode-ai/plugin"
 import type { RemoteConfig } from "../config.js"
 import type { PathMapper } from "../path-mapper.js"
 import type { SyncEngine } from "../sync-engine.js"
 import type { SSHPool } from "../ssh-pool.js"
 import { readFileWithBom, joinBom } from "../bom.js"
 import { quoteShell } from "../shell-quote.js"
+import type {
+  PermissionGateway,
+  RemoteToolDefinition,
+  ToolCallIdentity,
+} from "../v2-bridge.js"
 
 // ========================================================================
 // Copied from OpenCode packages/opencode/src/patch/index.ts
@@ -521,12 +525,22 @@ export function createPatchTool(
   config: RemoteConfig,
   pathMapper: PathMapper,
   syncEngine: SyncEngine,
-  sshPool: SSHPool
-) {
-  return tool({
+  sshPool: SSHPool,
+  permission: PermissionGateway
+): RemoteToolDefinition {
+  return {
+    name: "patch",
     description: `Apply a patch to files on the remote machine.`,
-    args: {
-      patchText: tool.schema.string().describe("The full patch text that describes all changes to be made"),
+    input: {
+      type: "object",
+      properties: {
+        patchText: {
+          type: "string",
+          description: "The full patch text that describes all changes to be made",
+        },
+      },
+      required: ["patchText"],
+      additionalProperties: false,
     },
     async execute(args, ctx) {
       if (!args.patchText.trim()) {
@@ -537,12 +551,12 @@ export function createPatchTool(
 
       let files: Array<{ path: string; apply: (content: string) => string; moveFrom?: string }>
       if (patchText.includes("*** Begin Patch")) {
-        files = await parseAndPrepareNative(patchText, config, pathMapper, ctx)
+        files = await parseAndPrepareNative(patchText, config, pathMapper, permission, ctx)
         if (files.length === 0) {
-          files = await parseAndPrepareUnified(patchText, config, pathMapper, ctx)
+          files = await parseAndPrepareUnified(patchText, config, pathMapper, permission, ctx)
         }
       } else {
-        files = await parseAndPrepareUnified(patchText, config, pathMapper, ctx)
+        files = await parseAndPrepareUnified(patchText, config, pathMapper, permission, ctx)
       }
 
       if (files.length === 0) {
@@ -589,21 +603,22 @@ export function createPatchTool(
       }
 
       return {
-        title: `Patched ${involvedPaths.size} file(s)`,
-        output: `Success. Updated the following files:\n${Array.from(involvedPaths).join("\n")}`,
+        content: `Success. Updated the following files:\n${Array.from(involvedPaths).join("\n")}`,
         metadata: {
+          title: `Patched ${involvedPaths.size} file(s)`,
           files: Array.from(involvedPaths),
         },
       }
     },
-  })
+  }
 }
 
 async function parseAndPrepareUnified(
   patchText: string,
   config: RemoteConfig,
   pathMapper: PathMapper,
-  ctx: any
+  permission: PermissionGateway,
+  identity: ToolCallIdentity
 ): Promise<Array<{ path: string; apply: (content: string) => string }>> {
   const parsed = parseUnifiedPatch(patchText)
   const result: Array<{ path: string; apply: (content: string) => string }> = []
@@ -613,7 +628,12 @@ async function parseAndPrepareUnified(
     if (!targetPath) continue
     const rp = normalizePatchPath(targetPath, config.remoteWorkdir)
     if (!pathMapper.isWithinWorkspace(rp)) {
-      await ctx.ask({ permission: "edit", patterns: [rp], always: [rp], metadata: { diff: patchText.slice(0, 2000) } })
+      await permission(identity, {
+        action: "edit",
+        resources: [rp],
+        save: [rp],
+        metadata: { diff: patchText.slice(0, 2000) },
+      })
     }
     const hasNoNewlineMarker = detectNoNewlineAtEnd(file.hunks)
     result.push({
@@ -629,7 +649,8 @@ async function parseAndPrepareNative(
   patchText: string,
   config: RemoteConfig,
   pathMapper: PathMapper,
-  ctx: any
+  permission: PermissionGateway,
+  identity: ToolCallIdentity
 ): Promise<Array<{ path: string; apply: (content: string) => string; moveFrom?: string }>> {
   const hunks = parsePatch(patchText).hunks
   const result: Array<{ path: string; apply: (content: string) => string; moveFrom?: string }> = []
@@ -637,7 +658,12 @@ async function parseAndPrepareNative(
   for (const hunk of hunks) {
     const rp = normalizePatchPath(hunk.path, config.remoteWorkdir)
     if (!pathMapper.isWithinWorkspace(rp)) {
-      await ctx.ask({ permission: "edit", patterns: [rp], always: [rp], metadata: { diff: patchText.slice(0, 2000) } })
+      await permission(identity, {
+        action: "edit",
+        resources: [rp],
+        save: [rp],
+        metadata: { diff: patchText.slice(0, 2000) },
+      })
     }
 
     if (hunk.type === "add") {

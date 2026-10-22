@@ -1,18 +1,31 @@
 import fs from "fs/promises"
 import path from "path"
-import { tool } from "@opencode-ai/plugin"
 import type { PathMapper } from "../path-mapper.js"
 import type { SyncEngine } from "../sync-engine.js"
 import { createTwoFilesPatch } from "diff"
 import { readFileWithBom, joinBom, splitBom } from "../bom.js"
 import { trimDiff } from "../diff-utils.js"
+import type { PermissionGateway, RemoteToolDefinition } from "../v2-bridge.js"
 
-export function createWriteTool(pathMapper: PathMapper, syncEngine: SyncEngine) {
-  return tool({
+export function createWriteTool(
+  pathMapper: PathMapper,
+  syncEngine: SyncEngine,
+  permission: PermissionGateway
+): RemoteToolDefinition {
+  return {
+    name: "write",
     description: `Write content to a file on the remote machine.`,
-    args: {
-      content: tool.schema.string().describe("The content to write to the file"),
-      filePath: tool.schema.string().describe("The absolute path to the file to write (must be absolute)"),
+    input: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "The content to write to the file" },
+        filePath: {
+          type: "string",
+          description: "The absolute path to the file to write (must be absolute)",
+        },
+      },
+      required: ["content", "filePath"],
+      additionalProperties: false,
     },
     async execute(args, ctx) {
       let remotePath = path.posix.normalize(args.filePath)
@@ -20,10 +33,10 @@ export function createWriteTool(pathMapper: PathMapper, syncEngine: SyncEngine) 
         remotePath = path.posix.join(pathMapper.remoteRoot, remotePath)
       }
       if (!pathMapper.isWithinWorkspace(remotePath)) {
-        await ctx.ask({
-          permission: "edit",
-          patterns: [remotePath],
-          always: [remotePath],
+        await permission(ctx, {
+          action: "edit",
+          resources: [remotePath],
+          save: [remotePath],
           metadata: {},
         })
       }
@@ -50,10 +63,10 @@ export function createWriteTool(pathMapper: PathMapper, syncEngine: SyncEngine) 
         ? generateDiffPreview(remotePath, oldContent, args.content)
         : `A ${remotePath}\n+ ${args.content.split("\n").slice(0, 10).join("\n+ ")}`
 
-      await ctx.ask({
-        permission: "edit",
-        patterns: [remotePath],
-        always: [remotePath],
+      await permission(ctx, {
+        action: "edit",
+        resources: [remotePath],
+        save: [remotePath],
         metadata: { diff: diffPreview },
       })
 
@@ -65,15 +78,15 @@ export function createWriteTool(pathMapper: PathMapper, syncEngine: SyncEngine) 
       await syncEngine.pushAll()
 
       return {
-        title: remotePath,
-        output: "Wrote file successfully.",
+        content: "Wrote file successfully.",
         metadata: {
+          title: remotePath,
           filepath: remotePath,
           exists: existed,
         },
       }
     },
-  })
+  }
 }
 
 function generateDiffPreview(filePath: string, oldText: string, newText: string): string {

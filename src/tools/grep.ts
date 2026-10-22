@@ -1,6 +1,6 @@
-import { tool } from "@opencode-ai/plugin"
 import type { RemoteConfig } from "../config.js"
 import type { SSHPool } from "../ssh-pool.js"
+import type { RemoteToolDefinition, RemoteToolResult } from "../v2-bridge.js"
 
 interface RgMatch {
   type: "match"
@@ -28,15 +28,31 @@ interface RgSummary {
 
 type RgMessage = RgMatch | RgSummary | { type: string }
 
-export function createGrepTool(config: RemoteConfig, sshPool: SSHPool) {
-  return tool({
+export function createGrepTool(config: RemoteConfig, sshPool: SSHPool): RemoteToolDefinition {
+  return {
+    name: "grep",
     description: `Search file contents using grep/ripgrep on the remote machine.`,
-    args: {
-      pattern: tool.schema.string().describe("The regex pattern to search for in file contents"),
-      path: tool.schema.string().optional().describe("The directory to search in. Defaults to the current working directory."),
-      include: tool.schema.string().optional().describe("File pattern to include in the search (e.g. '*.js', '*.{ts,tsx}')"),
+    input: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "The regex pattern to search for in file contents",
+        },
+        path: {
+          type: "string",
+          description:
+            "The directory to search in. Defaults to the current working directory.",
+        },
+        include: {
+          type: "string",
+          description: "File pattern to include in the search (e.g. '*.js', '*.{ts,tsx}')",
+        },
+      },
+      required: ["pattern"],
+      additionalProperties: false,
     },
-    async execute(args, ctx) {
+    async execute(args, _ctx) {
       const searchDir = args.path || config.remoteWorkdir
       const limit = 100
 
@@ -66,7 +82,7 @@ export function createGrepTool(config: RemoteConfig, sshPool: SSHPool) {
 
       return parseRgJsonOutput(result.stdout, searchDir, args.pattern, limit)
     },
-  })
+  }
 }
 
 function parseRgJsonOutput(stdout: string, searchDir: string, pattern: string, limit: number) {
@@ -122,12 +138,11 @@ function formatGrepResult(
   matches: Array<{ path: string; line: number; text: string }>,
   pattern: string,
   limit: number
-) {
+): RemoteToolResult {
   if (matches.length === 0) {
     return {
-      title: pattern,
-      output: "No files found",
-      metadata: { matches: 0, truncated: false },
+      content: "No files found",
+      metadata: { title: pattern, matches: 0, truncated: false },
     }
   }
 
@@ -157,9 +172,8 @@ function formatGrepResult(
   }
 
   return {
-    title: pattern,
-    output: output.join("\n"),
-    metadata: { matches: total, truncated },
+    content: output.join("\n"),
+    metadata: { title: pattern, matches: total, truncated },
   }
 }
 

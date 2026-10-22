@@ -1,16 +1,28 @@
-import { tool } from "@opencode-ai/plugin"
 import type { SSHPool } from "../ssh-pool.js"
+import type { RemoteToolDefinition } from "../v2-bridge.js"
 
-export function createBashTool(sshPool: SSHPool, defaultWorkdir: string) {
-  return tool({
+export function createBashTool(sshPool: SSHPool, defaultWorkdir: string): RemoteToolDefinition {
+  return {
+    name: "shell",
     description: `Execute commands in a bash shell on the remote machine.`,
-    args: {
-      command: tool.schema.string().describe("The bash command to execute"),
-      description: tool.schema.string().describe("A short description of what the command does"),
-      timeout: tool.schema.number().optional().describe("Timeout in milliseconds (optional)"),
-      workdir: tool.schema.string().optional().describe("Working directory on the remote machine (optional)"),
+    input: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The bash command to execute" },
+        description: {
+          type: "string",
+          description: "A short description of what the command does",
+        },
+        timeout: { type: "number", description: "Timeout in milliseconds (optional)" },
+        workdir: {
+          type: "string",
+          description: "Working directory on the remote machine (optional)",
+        },
+      },
+      required: ["command", "description"],
+      additionalProperties: false,
     },
-    async execute(args, ctx) {
+    async execute(args, _ctx) {
       const timeout = args.timeout ?? 120_000
       if (timeout < 0) {
         throw new Error("Timeout must be a non-negative number")
@@ -58,16 +70,16 @@ export function createBashTool(sshPool: SSHPool, defaultWorkdir: string) {
       }
 
       return {
-        title: args.description || "bash",
-        output,
+        content: output,
         metadata: {
+          title: args.description || "shell",
           exit: result.exitCode,
           description: args.description,
           stderr: stderr || undefined,
         },
       }
     },
-  })
+  }
 }
 
 const SSH_NOISE_PATTERNS = [

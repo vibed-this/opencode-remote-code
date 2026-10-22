@@ -1,24 +1,15 @@
+// Post-build step: copy the prompt template .txt files into dist/prompts.
+// (No source rewriting is needed anymore: the V2 plugin imports nothing from a
+//  local shim, every tool uses plain JSON Schema.)
 const fs = require('fs')
 const path = require('path')
 
-const toolsDir = path.join(__dirname, '..', 'dist', 'tools')
-const files = fs.readdirSync(toolsDir).filter(f => f.endsWith('.js'))
-
-for (const file of files) {
-  const filePath = path.join(toolsDir, file)
-  let content = fs.readFileSync(filePath, 'utf8')
-  const original = content
-  content = content.replace(/from "@opencode-ai\/plugin"/g, 'from "../types/plugin-shim.js"')
-  if (content !== original) {
-    fs.writeFileSync(filePath, content)
-    console.log(`[postbuild] Patched ${file}`)
-  }
-}
-
-// Copy prompt .txt files to dist/prompts
+const distDir = path.join(__dirname, '..', 'dist')
 const promptsSrc = path.join(__dirname, '..', 'src', 'prompts')
-const promptsDst = path.join(__dirname, '..', 'dist', 'prompts')
+const promptsDst = path.join(distDir, 'prompts')
+
 if (fs.existsSync(promptsSrc)) {
+  fs.mkdirSync(promptsDst, { recursive: true })
   const txtFiles = fs.readdirSync(promptsSrc).filter(f => f.endsWith('.txt'))
   for (const file of txtFiles) {
     fs.copyFileSync(path.join(promptsSrc, file), path.join(promptsDst, file))

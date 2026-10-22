@@ -2,6 +2,16 @@
 
 [中文](README.zh-CN.md)
 
+> **⚠️ This fork targets OpenCode V2 (`@opencode/plugin` ^2.1.2).**
+> Tool names are now `shell` / `patch` / `read` / `write` / `edit` / `glob` / `grep`
+> (V1's `bash` / `apply_patch` no longer exist in V2), and remote mode is configured
+> through the plugin `options` in `opencode.jsonc` instead of `REMOTE_*` environment
+> variables — V2 runs plugins inside a background service that does not inherit your
+> shell environment. See **[PORTING-NOTES.md](PORTING-NOTES.md)** for the working
+> config, and **[MIGRATION-V2.md](MIGRATION-V2.md)** for the verified V1→V2 API contract.
+> The sections below are kept from upstream and describe the V1 behaviour.
+> Forked from [zz6zz666/opencode-remote-code](https://github.com/zz6zz666/opencode-remote-code).
+
 An OpenCode plugin that lets AI agents operate remote machines over SSH — with **zero footprint** on the remote side. The remote machine only needs `sshd`; no agent, runtime, or dependency installation is required.
 
 The AI sees nothing different: it still calls `bash`, `edit`, `write`, `read`, `glob`, `grep`, and `apply_patch` exactly as it would locally.

@@ -11,6 +11,10 @@ tmp_*
 temp_*
 mcp-remote-code/
 
+# Local test harness artifacts (mock SSH server)
+test/tmp/
+test/.hostkey
+
 # Logs
 *.log
 

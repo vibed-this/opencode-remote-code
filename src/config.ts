@@ -26,6 +26,46 @@ export interface RemoteConfig {
   active: boolean
 }
 
+/** Where a resolved config value came from (useful for logging / debugging). */
+export type ConfigSource = "options" | "env" | "argv"
+
+export interface ConfigResolution {
+  value: string
+  source: ConfigSource
+}
+
+type ConfigKey = "ssh" | "workdir" | "password" | "sudoPassword" | "mirror"
+
+/**
+ * Option key aliases accepted from `ctx.options` (opencode.jsonc plugin options).
+ * camelCase is canonical, kebab-case is accepted for JSONC friendliness.
+ */
+const OPTION_KEYS: Record<ConfigKey, string[]> = {
+  ssh: ["ssh", "sshCommand", "ssh-command"],
+  workdir: ["workdir", "remoteWorkdir", "remote-workdir", "remote_workdir"],
+  password: ["password", "sshPassword", "ssh-password"],
+  sudoPassword: ["sudoPassword", "sudo-password", "sudo_password"],
+  mirror: ["mirror", "mirrorRoot", "mirror-root"],
+}
+
+/** Environment variable fallbacks (V1 behaviour, kept for compatibility). */
+const ENV_KEYS: Record<ConfigKey, string> = {
+  ssh: "REMOTE_SSH",
+  workdir: "REMOTE_WORKDIR",
+  password: "REMOTE_PASSWORD",
+  sudoPassword: "REMOTE_SUDO_PASSWORD",
+  mirror: "REMOTE_MIRROR",
+}
+
+/** Legacy CLI argv fallbacks (`--remote`, `--remote-workdir`, ...). */
+const ARGV_KEYS: Record<ConfigKey, string[]> = {
+  ssh: ["--remote", "--remote-ssh"],
+  workdir: ["--remote-workdir"],
+  password: ["--remote-password"],
+  sudoPassword: ["--remote-sudo-password"],
+  mirror: ["--remote-mirror"],
+}
+
 function parseArgv(): Record<string, string | undefined> {
   const args: Record<string, string | undefined> = {}
   const argv = process.argv
@@ -45,6 +85,51 @@ function parseArgv(): Record<string, string | undefined> {
   return args
 }
 
+function nonEmpty(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed === "" ? undefined : value
+}
+
+function fromOptions(
+  options: Record<string, unknown> | undefined,
+  keys: string[]
+): string | undefined {
+  if (!options) return undefined
+  for (const key of keys) {
+    const value = nonEmpty(options[key])
+    if (value !== undefined) return value
+  }
+  return undefined
+}
+
+/**
+ * Resolve one config value.
+ *
+ * Priority (V2): `ctx.options` > env vars > legacy `--remote*` argv.
+ * Plugin options win because OpenCode V2 plugins run inside a shared
+ * background service where shell environment variables are not visible.
+ */
+export function resolveConfigValue(
+  key: ConfigKey,
+  options?: Record<string, unknown>,
+  argv?: Record<string, string | undefined>
+): ConfigResolution | undefined {
+  const opt = fromOptions(options, OPTION_KEYS[key])
+  if (opt !== undefined) return { value: opt, source: "options" }
+
+  const env = nonEmpty(process.env[ENV_KEYS[key]])
+  if (env !== undefined) return { value: env, source: "env" }
+
+  const args = argv ?? parseArgv()
+  for (const flag of ARGV_KEYS[key]) {
+    const arg = nonEmpty(args[flag])
+    if (arg !== undefined) return { value: arg, source: "argv" }
+  }
+
+  return undefined
+}
+
 function parseSshCommand(cmd: string): {
   host: string
   user: string
@@ -54,7 +139,7 @@ function parseSshCommand(cmd: string): {
 } {
   const tokens = cmd.trim().split(/\s+/)
   if (tokens.length === 0 || tokens[0] !== "ssh") {
-    throw new Error(`Remote Code: --remote must start with "ssh", got: ${cmd}`)
+    throw new Error(`Remote Code: SSH command must start with "ssh", got: ${cmd}`)
   }
 
   let host = ""
@@ -67,7 +152,7 @@ function parseSshCommand(cmd: string): {
     const tok = tokens[i]
     if (tok === "-p" || tok === "--port") {
       port = parseInt(tokens[++i], 10)
-      if (isNaN(port)) throw new Error(`Remote Code: invalid port in --remote`)
+      if (isNaN(port)) throw new Error(`Remote Code: invalid port in SSH command`)
     } else if (tok === "-i") {
       identity = tokens[++i]
     } else if (tok.startsWith("-o")) {
@@ -93,7 +178,7 @@ function parseSshCommand(cmd: string): {
   }
 
   if (!host) {
-    throw new Error(`Remote Code: could not parse host from --remote: ${cmd}`)
+    throw new Error(`Remote Code: could not parse host from SSH command: ${cmd}`)
   }
   if (!user) {
     user = "root"
@@ -102,58 +187,52 @@ function parseSshCommand(cmd: string): {
   return { host, user, port, identity, extraOptions }
 }
 
+/**
+ * Load the remote config from plugin options, with env/argv compatibility
+ * fallbacks. Returns `null` when remote mode is not configured — the plugin
+ * then stays dormant and never touches SSH or the filesystem.
+ */
 export function loadConfig(options?: Record<string, unknown>): RemoteConfig | null {
-  const args = parseArgv()
+  const argv = parseArgv()
 
-  // Remote mode activation: MUST come from CLI args or env vars.
-  // Plugin options alone do NOT activate remote mode.
-  const hasCliRemote = Boolean(args["--remote"] || args["--remote-ssh"])
-  const hasEnvRemote = Boolean(process.env.REMOTE_SSH)
-
-  if (!hasCliRemote && !hasEnvRemote) {
+  const ssh = resolveConfigValue("ssh", options, argv)
+  if (!ssh) {
     return null
   }
 
-  // Priority: CLI args > env vars > plugin options (fallback only)
-  const opt = (key: string): string | undefined => {
-    const legacyKey = key === "ssh" ? "--remote" : `--remote-${key}`
-    const cliKey = `--remote-${key}`
-    if (args[legacyKey]) return args[legacyKey]
-    if (args[cliKey]) return args[cliKey]
-    const envKey = key === "ssh" ? "REMOTE_SSH" : `REMOTE_${key.toUpperCase()}`
-    const envValue = process.env[envKey]
-    if (envValue) return envValue
-    // Fallback to plugin options for supplementary config only
-    if (options && typeof options[key] === "string") return options[key] as string
-    return undefined
-  }
+  const parsed = parseSshCommand(ssh.value)
 
-  const sshCommand = opt("ssh")
-  if (!sshCommand) {
-    return null
-  }
-
-  const remoteWorkdir = opt("workdir")
-  if (!remoteWorkdir) {
+  const workdir = resolveConfigValue("workdir", options, argv)
+  if (!workdir) {
     throw new Error(
-      `Remote Code: remote SSH is configured but remote-workdir is missing. Provide it via --remote-workdir, plugin options, or REMOTE_WORKDIR env var.`
+      `Remote Code: remote SSH is configured but the remote working directory is missing. ` +
+        `Provide it via plugin option "workdir" (or "remote-workdir"), the REMOTE_WORKDIR env var, or --remote-workdir.`
     )
   }
 
-  const parsed = parseSshCommand(sshCommand)
-  const mirrorRoot =
-    opt("mirror") ?? path.join(os.homedir(), ".opencode", "mirrors")
-
-  const password = opt("password")
-  const sudoPassword = opt("sudo-password")
+  const mirror = resolveConfigValue("mirror", options, argv)
+  const password = resolveConfigValue("password", options, argv)
+  const sudoPassword = resolveConfigValue("sudoPassword", options, argv)
 
   return {
-    sshCommand,
+    sshCommand: ssh.value,
     ...parsed,
-    password,
-    sudoPassword,
-    remoteWorkdir,
-    mirrorRoot,
+    password: password?.value,
+    sudoPassword: sudoPassword?.value,
+    remoteWorkdir: workdir.value,
+    mirrorRoot: mirror?.value ?? path.join(os.homedir(), ".opencode", "mirrors"),
     active: true,
   }
+}
+
+/** Human-readable description of where each value came from (for debug logs). */
+export function describeConfigSources(options?: Record<string, unknown>): string {
+  const argv = parseArgv()
+  const keys: ConfigKey[] = ["ssh", "workdir", "password", "sudoPassword", "mirror"]
+  return keys
+    .map((key) => {
+      const resolved = resolveConfigValue(key, options, argv)
+      return `${key}=${resolved ? resolved.source : "unset"}`
+    })
+    .join(" ")
 }

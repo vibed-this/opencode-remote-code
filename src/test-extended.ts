@@ -32,6 +32,7 @@ import { createPatchTool } from "./tools/patch.js"
 import { createReadTool } from "./tools/read.js"
 import { createWriteTool } from "./tools/write.js"
 import { quoteShell } from "./shell-quote.js"
+import type { PermissionGateway, ToolCallIdentity } from "./v2-bridge.js"
 
 // Load .env.test if present (gitignored — never commit credentials)
 try {
@@ -68,7 +69,8 @@ function ensureEnv() {
 }
 
 // =============================================================================
-// Enhanced mock context that captures diff/permission metadata
+// Mock tool identity + permission recorder
+// (V2: tools ask through an injected PermissionGateway, not ctx.ask)
 // =============================================================================
 interface CapturedAsk {
   permission: string
@@ -76,21 +78,25 @@ interface CapturedAsk {
   metadata: Record<string, any>
 }
 
+const asksLog: CapturedAsk[] = []
+
+/** Shared by every tool; records what each tool asks permission for. */
+const recordingPermission: PermissionGateway = async (_identity, request) => {
+  asksLog.push({
+    permission: request.action,
+    patterns: request.resources,
+    metadata: request.metadata ?? {},
+  })
+}
+
 function createRecordingCtx() {
-  const asks: CapturedAsk[] = []
+  asksLog.length = 0
   return {
-    sessionID: "test-session",
+    sessionID: "test-session" as ToolCallIdentity["sessionID"],
     messageID: "test-msg",
-    agent: "test-agent",
-    directory: "/mock/local",
-    worktree: "/mock/local",
-    abort: new AbortController().signal,
-    metadata: (_input: { title?: string; metadata?: Record<string, any> }) => {},
-    ask: async (input: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, any> }) => {
-      asks.push({ permission: input.permission, patterns: input.patterns, metadata: input.metadata })
-    },
-    getAsks: () => asks,
-    lastAsk: () => asks[asks.length - 1],
+    id: "test-call",
+    getAsks: () => asksLog,
+    lastAsk: () => asksLog[asksLog.length - 1],
   }
 }
 
@@ -129,10 +135,10 @@ async function runAll() {
   await fs.mkdir(pathMapper.mirrorBase, { recursive: true })
   ;(manifest as any).manifest = { remote_root: pathMapper.remoteRoot, files: {} }
 
-  const readTool = createReadTool(pathMapper, syncEngine, sshPool)
-  const writeTool = createWriteTool(pathMapper, syncEngine)
-  const editTool = createEditTool(pathMapper, syncEngine)
-  const patchTool = createPatchTool(config, pathMapper, syncEngine, sshPool)
+  const readTool = createReadTool(pathMapper, syncEngine, sshPool, recordingPermission)
+  const writeTool = createWriteTool(pathMapper, syncEngine, recordingPermission)
+  const editTool = createEditTool(pathMapper, syncEngine, recordingPermission)
+  const patchTool = createPatchTool(config, pathMapper, syncEngine, sshPool, recordingPermission)
   const globTool = createGlobTool(config, sshPool)
 
   // Pre-create remote workdir structure
@@ -151,7 +157,7 @@ async function runAll() {
     )
     const ctx = createRecordingCtx()
     const result = await readTool.execute({ filePath: `${REMOTE_WORKDIR}/bom_test.ts` }, ctx)
-    const output = (result as any).output as string
+    const output = (result as any).content as string
     // Debug: print first 200 chars of output
     // BOM should be present in the output stream (first char of content after line number)
     const contentMatch = output.match(/<content>\n([\s\S]*?)\n\(End of file/)
@@ -385,7 +391,7 @@ async function runAll() {
       { filePath: `${REMOTE_WORKDIR}/paginate.txt`, limit: 50 },
       ctx
     )
-    const output = (result as any).output as string
+    const output = (result as any).content as string
     const lines = output.split("\n").filter((l) => l.match(/^\d+: line/))
     if (lines.length !== 50) throw new Error(`Expected 50 lines, got ${lines.length}`)
     if (!output.includes("Use offset=51 to continue")) throw new Error("Pagination hint missing")
@@ -397,7 +403,7 @@ async function runAll() {
       { filePath: `${REMOTE_WORKDIR}/paginate.txt`, offset: 100, limit: 10 },
       ctx
     )
-    const output = (result as any).output as string
+    const output = (result as any).content as string
     const firstLine = output.split("\n").find((l) => l.includes("line"))
     if (!firstLine?.includes("100: line100")) throw new Error(`Expected line 100, got: ${firstLine}`)
   })
@@ -506,7 +512,7 @@ async function runAll() {
       { pattern: "*.{ts,tsx}", path: `${REMOTE_WORKDIR}/src` },
       createRecordingCtx()
     )
-    const output = (result as any).output as string
+    const output = (result as any).content as string
     if (!output.includes("a.ts")) throw new Error("a.ts not found via brace expansion")
     if (!output.includes("b.tsx")) throw new Error("b.tsx not found via brace expansion")
     if (output.includes("c.js")) throw new Error("c.js should NOT match *.{ts,tsx}")

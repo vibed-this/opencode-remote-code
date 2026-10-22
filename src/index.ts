@@ -1,8 +1,8 @@
 import fs from "fs/promises"
 import os from "os"
 import path from "path"
-import type { Plugin } from "@opencode-ai/plugin"
-import { loadConfig } from "./config.js"
+import { Plugin } from "@opencode/plugin"
+import { describeConfigSources, loadConfig } from "./config.js"
 import { ManifestManager } from "./manifest.js"
 import { PathMapper } from "./path-mapper.js"
 import { createSSHPool } from "./ssh-pool.js"
@@ -15,124 +15,169 @@ import { createPatchTool } from "./tools/patch.js"
 import { createReadTool } from "./tools/read.js"
 import { createWriteTool } from "./tools/write.js"
 import { buildRemoteSystemPrompt } from "./remote-system-prompt.js"
+import {
+  createPermissionGateway,
+  type PluginContext,
+  type RemoteToolDefinition,
+} from "./v2-bridge.js"
+
+const LOG_FILE = path.join(os.homedir(), ".opencode", "remote-code-debug.log")
+
+/** Debug logging is opt-in (REMOTE_CODE_DEBUG=1) unless remote mode is active. */
+let debugEnabled = process.env.REMOTE_CODE_DEBUG === "1"
 
 async function logDebug(msg: string) {
-  const logFile = path.join(os.homedir(), ".opencode", "remote-code-debug.log")
+  if (!debugEnabled) return
   const line = `[${new Date().toISOString()}] ${msg}\n`
-  await fs.appendFile(logFile, line).catch(() => {})
+  await fs.appendFile(LOG_FILE, line).catch(() => {})
 }
 
-const RemoteCodePlugin: Plugin = async (input, options) => {
-  await logDebug(`Plugin loaded. options=${JSON.stringify(options)}`)
-  await logDebug(`env.REMOTE_SSH=${process.env.REMOTE_SSH}`)
-  await logDebug(`env.REMOTE_WORKDIR=${process.env.REMOTE_WORKDIR}`)
-  await logDebug(`env.REMOTE_PASSWORD=${process.env.REMOTE_PASSWORD ? "***" : "undefined"}`)
+export default Plugin.define({
+  id: "remote-code",
 
-  const config = loadConfig(options)
+  async setup(ctx: PluginContext) {
+    // ---------------------------------------------------------------------
+    // 1. Config. V2 reads `ctx.options` first (env vars / argv only as a
+    //    compatibility fallback, see config.ts). Nothing is written and no
+    //    connection is opened until we know remote mode is configured.
+    // ---------------------------------------------------------------------
+    let config
+    try {
+      config = loadConfig(ctx.options as Record<string, unknown>)
+    } catch (error) {
+      // Misconfigured (e.g. SSH string given but workdir missing): stay
+      // dormant instead of crashing the host, but make the reason loud.
+      console.error(`[remote-code] ${(error as Error).message}`)
+      await logDebug(`config error: ${(error as Error).message}`)
+      return
+    }
 
-  if (!config) {
-    await logDebug("Config is null - remote mode not activated")
-    return {}
-  }
+    if (!config) {
+      // Dormant: OpenCode keeps running in local mode. No side effects.
+      await logDebug("Config is null - remote mode not activated")
+      return
+    }
 
-  await logDebug(`Config loaded: host=${config.host}, workdir=${config.remoteWorkdir}`)
+    debugEnabled = true
+    await logDebug("Plugin loaded")
+    await logDebug(`config sources: ${describeConfigSources(ctx.options as Record<string, unknown>)}`)
+    await logDebug(`Config loaded: host=${config.host}, workdir=${config.remoteWorkdir}`)
 
-  const pathMapper = new PathMapper(config)
-  const manifest = new ManifestManager(pathMapper)
-  await manifest.load()
+    // ---------------------------------------------------------------------
+    // 2. Local mirror + SSH pool (unchanged behaviour from V1)
+    // ---------------------------------------------------------------------
+    const pathMapper = new PathMapper(config)
+    const manifest = new ManifestManager(pathMapper)
+    await manifest.load()
 
-  const sshPool = await createSSHPool(config)
-  const syncEngine = new SyncEngine(config, pathMapper, manifest, sshPool)
+    const sshPool = await createSSHPool(config)
+    const syncEngine = new SyncEngine(config, pathMapper, manifest, sshPool)
 
-  // Clean and recreate mirror base to avoid stale files from previous sessions
-  try {
-    await fs.rm(pathMapper.mirrorBase, { recursive: true, force: true })
-  } catch {}
-  await mkdirp(pathMapper.mirrorBase)
+    // Clean and recreate mirror base to avoid stale files from previous sessions
+    try {
+      await fs.rm(pathMapper.mirrorBase, { recursive: true, force: true })
+    } catch {}
+    await mkdirp(pathMapper.mirrorBase)
 
-  // Reset manifest since we're starting fresh
-  ;(manifest as any).manifest = { remote_root: pathMapper.remoteRoot, files: {} }
+    // Reset manifest since we're starting fresh
+    ;(manifest as any).manifest = { remote_root: pathMapper.remoteRoot, files: {} }
 
-  // Probe remote environment
-  let remotePlatform = "linux"
-  let isGitRepo = false
-  try {
-    const uname = await sshPool.exec("uname -s", { timeout: 5_000 })
-    remotePlatform = uname.stdout.trim().toLowerCase()
-  } catch {}
-  try {
-    const gitCheck = await sshPool.exec(
-      `git -C "${config.remoteWorkdir}" rev-parse --git-dir 2>/dev/null && echo GIT || echo NO_GIT`,
-      { timeout: 5_000 }
-    )
-    isGitRepo = gitCheck.stdout.trim().includes("GIT")
-  } catch {}
+    // Probe remote environment
+    let remotePlatform = "linux"
+    let isGitRepo = false
+    try {
+      const uname = await sshPool.exec("uname -s", { timeout: 5_000 })
+      remotePlatform = uname.stdout.trim().toLowerCase()
+    } catch {}
+    try {
+      const gitCheck = await sshPool.exec(
+        `git -C "${config.remoteWorkdir}" rev-parse --git-dir 2>/dev/null && echo GIT || echo NO_GIT`,
+        { timeout: 5_000 }
+      )
+      isGitRepo = gitCheck.stdout.trim().includes("GIT")
+    } catch {}
 
-  const remoteWorkdir = config.remoteWorkdir
+    const remoteWorkdir = config.remoteWorkdir
 
-  const tools = {
-    bash: createBashTool(sshPool, config.remoteWorkdir),
-    glob: createGlobTool(config, sshPool),
-    grep: createGrepTool(config, sshPool),
-    read: createReadTool(pathMapper, syncEngine, sshPool),
-    write: createWriteTool(pathMapper, syncEngine),
-    edit: createEditTool(pathMapper, syncEngine),
-    apply_patch: createPatchTool(config, pathMapper, syncEngine, sshPool),
-  }
+    // ---------------------------------------------------------------------
+    // 3. Tools (V2: plain objects + JSON Schema, registered via transform)
+    // ---------------------------------------------------------------------
+    const permission = createPermissionGateway(ctx.permission)
 
-  return {
-    tool: tools,
-    event: async ({ event }) => {
-      if (event.type === "session.deleted") {
-        await manifest.save()
-        await sshPool.close()
+    const tools: RemoteToolDefinition[] = [
+      createBashTool(sshPool, remoteWorkdir),
+      createGlobTool(config, sshPool),
+      createGrepTool(config, sshPool),
+      createReadTool(pathMapper, syncEngine, sshPool, permission),
+      createWriteTool(pathMapper, syncEngine, permission),
+      createEditTool(pathMapper, syncEngine, permission),
+      createPatchTool(config, pathMapper, syncEngine, sshPool, permission),
+    ]
+
+    const toolRegistration = await ctx.tool.transform((editor) => {
+      for (const tool of tools) {
+        // V2 builtin names: shell / read / write / edit / patch / glob / grep
+        editor.add(tool)
       }
-    },
-    "experimental.chat.system.transform": async (
-      _input: { sessionID?: string; model: any },
-      output: { system: string[] }
-    ) => {
-      await logDebug(`system.transform called. modelID=${_input.model?.api?.id ?? _input.model?.id ?? "unknown"}`)
+    })
+    await logDebug(`registered tools: ${tools.map((t) => t.name).join(", ")}`)
 
-      // Identify title-generator element (preserve it)
-      const titleGeneratorIdx = output.system.findIndex((s) =>
-        s.includes("You are a title generator")
+    // ---------------------------------------------------------------------
+    // 4. System prompt replacement (V2: session "context" hook)
+    // ---------------------------------------------------------------------
+    const hookRegistration = await ctx.session.hook("context", async (event) => {
+      // `event.system` is an array of SystemPart objects ({ type, text }).
+      const current = event.system.map((part) => part.text)
+      const titleGeneratorIdx = current.findIndex((text) =>
+        text.includes("You are a title generator")
       )
 
-      // Build remote system prompt to replace everything except title generator
+      // Auxiliary title-generation requests carry only the title prompt;
+      // leave them untouched (they never call tools).
+      if (titleGeneratorIdx !== -1 && event.system.length === 1) return
+
       const remoteSystem = await buildRemoteSystemPrompt(
         {
-          modelID: _input.model?.api?.id ?? _input.model?.id ?? "default",
+          modelID: event.model?.id ? String(event.model.id) : "default",
           remoteWorkdir,
           remotePlatform,
           isGitRepo,
           sshPool,
         },
-        output.system
+        current
       )
 
       if (titleGeneratorIdx !== -1) {
-        // Replace all non-title-generator elements with our remote system prompt
-        const titleGenerator = output.system[titleGeneratorIdx]
-        output.system.length = 0
-        output.system.push(titleGenerator, ...remoteSystem)
+        // Preserve the title generator, replace everything else (V1 semantics).
+        const titleGenerator = event.system[titleGeneratorIdx]
+        event.system.length = 0
+        event.system.push(titleGenerator, ...remoteSystem.map(toSystemPart))
       } else {
-        // No title generator found — replace entire array
-        output.system.length = 0
-        output.system.push(...remoteSystem)
+        event.system.length = 0
+        event.system.push(...remoteSystem.map(toSystemPart))
       }
 
-      await logDebug(`system.transform done. output.system.length=${output.system.length}`)
-    },
-  }
+      await logDebug(`context hook done. system parts=${event.system.length}`)
+    })
+
+    // ---------------------------------------------------------------------
+    // 5. Cleanup (replaces V1's `session.deleted` event handler)
+    // ---------------------------------------------------------------------
+    return async () => {
+      await logDebug("Plugin cleanup: saving manifest and closing SSH pool")
+      await hookRegistration.dispose().catch(() => {})
+      await toolRegistration.dispose().catch(() => {})
+      await manifest.save().catch(() => {})
+      await sshPool.close().catch(() => {})
+    }
+  },
+})
+
+function toSystemPart(text: string): { type: "text"; text: string } {
+  return { type: "text", text }
 }
 
 async function mkdirp(dir: string): Promise<void> {
   const { mkdir } = await import("fs/promises")
   await mkdir(dir, { recursive: true }).catch(() => {})
-}
-
-export default {
-  id: "remote-code",
-  server: RemoteCodePlugin,
 }
