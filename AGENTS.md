@@ -21,6 +21,35 @@ With **no** `ssh` and no `host` option the plugin is fully **dormant**: no SSH c
 
 A **misconfigured** target (unparseable ssh string, conflicting structured fields, an SSH feature ssh2 cannot emulate) throws out of `loadConfig()`; `src/index.ts` catches it, prints one `[remote-code] …` line to stderr and stays dormant. The plugin never crashes the host.
 
+#### Local and remote in one config (`activateIn`)
+
+All seven tools are **name overrides**, so an *active* plugin means the session has **no local file access at all** — there is no second `read` for the local disk. That is fine for a dedicated remote config, but it makes "one global `opencode.jsonc` that also drives my local projects" impossible… unless activation itself is scoped.
+
+`activateIn` scopes activation to **local directories**:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "C:/Users/WIN11/.config/opencode/remote-code",
+      "options": {
+        "ssh": "ssh -p 48713 zhouxiaokang@frp-use.com",
+        "workdir": "C:/Users/zhouxiaokang/",
+        "password": "***",
+        "activateIn": "~/.opencode/remote-sessions"
+      }
+    }
+  ]
+}
+```
+
+- The plugin compares `ctx.location.directory` (the session's local working directory, exposed by V2) against the prefixes. Inside → all seven tools register as usual. Outside → `setup()` logs one line and returns, i.e. **dormant**, and OpenCode's native local tools are what the model sees.
+- Accepts a string or an array; `~` is expanded; trailing separators are ignored.
+- Matching is **boundary-safe** (`…/remote-sessions-archive` is *not* inside `…/remote-sessions`) and case-insensitive on Windows only. A missing/relative `ctx.location.directory` is treated as **outside** — guessing would silently strip a session's local tools.
+- Empty/absent = always active, i.e. the historical behaviour.
+
+This pairs with the launchers, which pin a stable session directory per target (`~/.opencode/remote-sessions/<host>_<workdir-slug>/`): remote tools inside launcher sessions, native local tools everywhere else, from one config. It is the *only* clean solution — a `coexist: true` mode (register the tools without overriding) was rejected, because two same-named tools make the model pick one at random and run it on the wrong machine.
+
 #### Linux / macOS remote
 
 ```jsonc
@@ -151,7 +180,8 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | Ignore names | `ignore` | **extends** the built-in list, never replaces it |
 | Tool limits | `limits` | see below |
 | Default `shell` timeout | `timeout` | `120000` ms (`limits.shellTimeout`) |
-| Connection pool | `pool` | `{ "command": 3, "file": 2, "stagger": 0 }` |
+| Connection pool | `pool` | `{ "command": 3, "file": 4, "stagger": 0 }` |
+| Activation scope | `activateIn`, `activate-in` | `[]` = always active; otherwise a local directory or array of them (see below) |
 
 `limits` keys and defaults (`src/limits.ts`; numbers may also be given as strings):
 
@@ -161,12 +191,12 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | `searchMatches` | `100` | `grep` match cap |
 | `searchBytes` | `67108864` (64 MiB) | `grep` total bytes actually read |
 | `searchFileSize` | `2097152` (2 MiB) | `grep` per-file skip threshold |
-| `searchMillis` | `20000` | `grep` wall clock |
+| `searchMillis` | `45000` | `grep` wall clock, and the `glob`/`grep` traversal budget |
 | `walkDepth` | `12` | `glob` + `grep` traversal depth |
 | `walkEntries` | `20000` | `glob` + `grep` directory entries visited |
 | `shellTimeout` | `120000` | `shell` (overridden by the `timeout` option) |
 
-Built-in ignore names (15, matched against the directory *name* at any depth): `node_modules`, `.git`, `.hg`, `.svn`, `dist`, `build`, `out`, `target`, `.venv`, `venv`, `vendor`, `__pycache__`, `.next`, `.cache`, `.turbo`. Matching is case-insensitive only when the remote is Windows.
+Built-in ignore names (20, matched against the directory *name* at any depth): `node_modules`, `.git`, `.hg`, `.svn`, `dist`, `build`, `out`, `target`, `.venv`, `venv`, `vendor`, `__pycache__`, `.next`, `.cache`, `.turbo`, plus the volume-root noise `$RECYCLE.BIN`, `System Volume Information`, `Windows.old`, `.pnpm-store`, `.Trash`. Matching is case-insensitive only when the remote is Windows. The last five exist because a remote workspace is often the login home or a whole drive, where those trees hold tens of thousands of unrelated entries that would burn the traversal budget before reaching the project.
 
 Removed keys still get one loud message: `sudoPassword` / `sudo-password` → `console.warn` (it only ever made sense on POSIX and the plugin never escalates); `jump` / `jumpHost` / `proxyJump` / `proxyCommand` → hard error.
 
@@ -324,7 +354,7 @@ export default Plugin.define({
 The plugin uses the pure-Node.js `ssh2` library; no external `ssh`, `sshpass` or `rsync` binary is needed, and password auth is native.
 
 - **Command pool** (`options.pool.command`, default 3): `shell` execution, plus the one-shot `where.exe pwsh` probe.
-- **File pool** (`options.pool.file`, default 2): every SFTP session.
+- **File pool** (`options.pool.file`, default 4): every SFTP session. It is 4, not 2, because `walk()` issues up to 8 concurrent `readdir` requests: over a tunnelled link (0.3–0.8 s per round trip) a 2-connection pool serialised almost all of that work.
 - `options.pool.stagger` (default 0 ms) delays sequential handshakes for servers that dislike connection bursts.
 
 Pool defaults are deliberately conservative. A pool whose connect fails rejects all waiters and leaves no timers behind (`test/ssh-pool-lifecycle.mjs` guards that).
@@ -386,7 +416,7 @@ otherwise              →  SFTP write <home>/AppData/Local/Temp/oc-<hex8>.ps1 (
 | --- | --- | --- | --- |
 | `shell` | SSH exec (dialect) | Description is `Execute commands in <shellName> on the remote machine.`; `workdir` defaults to the workspace root; a timeout is reported as its own failure (`Command timed out after <n>ms`), distinct from a non-zero exit; SSH banner noise is filtered; the exit code is trusted (no stderr heuristics — OpenSSH ≥ 8.0 required) | `timeout` (default 120 s); oversized PS scripts staged as above |
 | `glob` | SFTP walk | ripgrep-flavoured matcher: `*`, `?`, `**`, `**/`, `{a,b}`, `[abc]`/`[!abc]`; a pattern without `/` matches the **basename**; backslashes in the pattern are separators; results newest-first (mtime desc, path asc on ties) | depth 12 / 20 000 entries / 100 results |
-| `grep` | SFTP read | **JavaScript `RegExp` dialect** (`rg` and `grep -Ern` are gone); leading `(?i)` / `(?m)` / `(?s)` are lifted into flags and are the *only* place inline flags are accepted; `include` is a glob on the walk-relative path; results in **walk order**, grouped per file, `Line <n>: <text>` | 100 matches / 64 MiB read / 2 MiB per file / 20 s |
+| `grep` | SFTP read | **JavaScript `RegExp` dialect** (`rg` and `grep -Ern` are gone); leading `(?i)` / `(?m)` / `(?s)` are lifted into flags and are the *only* place inline flags are accepted; `include` is a glob on the walk-relative path; results in **walk order**, grouped per file, `Line <n>: <text>` | 100 matches / 64 MiB read / 2 MiB per file / 45 s |
 | `read` | SFTP + mirror | `stat` → directory? `readdir` (dirs get `/`, symlinks get `@`) → missing? `readdir(parent)` for "did you mean" → binary gate (`readPrefix(8 KiB)` NUL, plus an extension blacklist) → `ensureLocal` → read the **local** copy so it is byte-identical to what `write`/`edit` will see | 2000 lines, 50 KB output, 2000 chars/line |
 | `write` | mirror + per-file push | Keeps the file's own line ending, a new file gets `\n`; BOM preserved; unified-diff preview in the permission request | — |
 | `edit` | mirror + per-file push | 9 fallback replacers (full OpenCode native set), per-file lock, CRLF preserved, whole-line `\r` normalisation via `tools/text.ts` | — |
@@ -572,6 +602,7 @@ Every suite is also runnable alone (`node test/<suite>.mjs`, exit 0 = all PASS):
 | `glob-matcher.mjs` | `*`/`?`/`**`/`{a,b}`/`[..]`, basename-only patterns, backslash separators, case folding, metacharacter escaping |
 | `path-mapper.mjs` | namespace layout, `toLocal`↔`toRemote` round trip, workspace boundary, long paths, collision suffixes |
 | `remote-walk.mjs` | `walk()` depth/ignore/symlink/entry/time budgets, `searchFiles()` budgets and `(?i)` lifting, `RemoteFs` SFTP error mapping |
+| `config-activate.mjs` | `activateIn` parsing/matching (`~`, boundary safety, Windows-only case folding), the `scope=` log field, and the 3.0.1 defaults (45 s, `pool.file` 4, volume-root ignore names) |
 | `plugin-entry.mjs` | the root `index.js` shim and V2's directory-entry resolution rules |
 | `ssh-pool-lifecycle.mjs` | no leaked timers on a failed connect, process exits by itself, idempotent `close()`, queued waiters rejected |
 | `verify-mock-server.mjs` | the mock server itself: password auth, exec stdout/exit codes, SFTP round trips, path-escape protection |

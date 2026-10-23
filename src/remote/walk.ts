@@ -69,12 +69,19 @@ export const DEFAULT_WALK_IGNORE: readonly string[] = [
   "vendor",
   "__pycache__",
   ".next",
+  "$RECYCLE.BIN",
+  "System Volume Information",
+  "Windows.old",
+  ".pnpm-store",
+  ".Trash",
 ]
 
 export const WALK_DEFAULTS = {
   maxDepth: 12,
   maxEntries: 20_000,
-  maxMillis: 20_000,
+  // 45 s, not 20 s — see `limits.ts`. Over a tunnelled link each `readdir`
+  // costs 0.3–0.8 s, so 20 s buys very little tree.
+  maxMillis: 45_000,
   concurrency: 8,
 } as const
 

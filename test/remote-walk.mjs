@@ -447,6 +447,61 @@ await check("search: a truncated walk is surfaced as reason `walk`", async () =>
   assert.equal(r.reason, "walk")
 })
 
+await check("search: walk truncation is reported even when the read loop finished", async () => {
+  // The dangerous shape: candidates exist, they are all read cleanly, and the
+  // *listing* was short. `truncated`/`reason` describe the read loop, so without
+  // the propagation fields the tool would happily print "No files found".
+  const f = new FakeFs()
+  f.file("/root/a.txt", "haystack")
+  f.file("/root/b.txt", "haystack")
+  f.file("/root/c.txt", "needle")
+  const r = await searchFiles(f, ops, {
+    root: "/root",
+    pattern: "needle",
+    walkLimits: { maxEntries: 2 },
+  })
+  assert.equal(r.walkTruncated, true)
+  assert.equal(r.walkReason, "entries")
+  assert.equal(typeof r.walkEntries, "number")
+  assert.ok(r.walkEntries >= 2, `expected >= 2 entries visited, saw ${r.walkEntries}`)
+  // The read loop finished cleanly, yet the result must still be flagged: the
+  // caller turns `reason === "walk"` into "matches may be missing".
+  assert.equal(r.truncated, true)
+  assert.equal(r.reason, "walk")
+})
+
+await check("search: a clean walk reports walkTruncated=false and no walkReason", async () => {
+  const f = new FakeFs()
+  f.file("/root/a.txt", "needle")
+  const r = await searchFiles(f, ops, { root: "/root", pattern: "needle" })
+  assert.equal(r.walkTruncated, false)
+  assert.equal(r.walkReason, undefined)
+  assert.equal(r.truncated, false)
+  assert.equal(r.reason, undefined)
+  assert.ok(r.walkEntries > 0)
+})
+
+await check("search: an exhausted time budget blames the walk when nothing was read", async () => {
+  // Observed on a real remote: one `readdir` costs 0.3–0.8 s, so the walk ate
+  // the whole budget and the search reported "time" with 0 files scanned — which
+  // reads like "the search was too slow" instead of "we never listed the tree".
+  const f = new FakeFs()
+  f.file("/root/a.txt", "needle")
+  f.dir("/root/sub")
+  f.readdirDelayMs = 40
+  const r = await searchFiles(f, ops, {
+    root: "/root",
+    pattern: "needle",
+    maxMillis: 20,
+    walkLimits: { maxMillis: 20 },
+  })
+  assert.equal(r.scannedFiles, 0)
+  assert.equal(r.truncated, true)
+  assert.equal(r.reason, "walk")
+  assert.equal(r.walkTruncated, true)
+  assert.equal(r.walkReason, "time")
+})
+
 await check("search: ignore list is forwarded to the walk", async () => {
   const f = new FakeFs()
   f.file("/root/src/a.ts", "needle")

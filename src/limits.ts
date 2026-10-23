@@ -30,7 +30,10 @@ export const DEFAULT_TOOL_LIMITS: Readonly<ToolLimits> = Object.freeze({
   searchMatches: 100,
   searchBytes: 64 * 1024 * 1024,
   searchFileSize: 2 * 1024 * 1024,
-  searchMillis: 20_000,
+  // 45 s, not 20 s: SFTP is request/response, so a WAN/tunnelled remote costs
+  // 0.3–0.8 s per directory. At 20 s a walk of a login-home-sized tree was cut
+  // off before a single file had been read.
+  searchMillis: 45_000,
   walkDepth: 12,
   walkEntries: 20_000,
   shellTimeout: 120_000,
@@ -56,6 +59,14 @@ export const DEFAULT_IGNORE: readonly string[] = Object.freeze([
   ".next",
   ".cache",
   ".turbo",
+  // Volume-root noise. A remote workspace is often the login home — or a whole
+  // drive — and these hold tens of thousands of unrelated entries that would
+  // burn the walk budget before reaching the project.
+  "$RECYCLE.BIN",
+  "System Volume Information",
+  "Windows.old",
+  ".pnpm-store",
+  ".Trash",
 ])
 
 /** Merge a user-supplied partial `limits` option over the defaults, ignoring junk. */

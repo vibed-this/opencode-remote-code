@@ -23,23 +23,23 @@ node test/glob-matcher.mjs           # 只跑 glob 匹配器的单元断言
 node test/remote-walk.mjs            # 只跑远端遍历/读取的单元断言
 node test/path-mapper.mjs            # 只跑镜像路径映射的单元断言
 node test/ssh-pool-lifecycle.mjs     # 只跑连接池生命周期/泄漏断言
+node test/config-activate.mjs        # 只跑 activateIn 作用域 + 3.0.1 默认值断言
 ```
 
 - 全部通过时 exit 0，否则 exit 1（`--dialect` 写错也是 1，并打印用法）。
 - 所有断言只依赖 stdio，不连任何外部服务。
 - 默认账号：`testuser` / `testpass`（可用 `MOCK_SSH_USER` / `MOCK_SSH_PASSWORD` 覆盖）。
-- 当前基线（Node v26，2026-10-23 实测）：
+- 当前基线（Node v26，2026-10-23 实测，3.0.1）：
 
   | 命令 | 结果 | 用时 |
   | --- | --- | --- |
-  | `node test/run-tests.mjs` | `total: PASS=85 FAIL=1 SKIP=3 (36.9s) dialect=both` → `RESULT: FAIL` | ~37s |
-  | `node test/run-tests.mjs --dialect=posix --skip-slow` | `total: PASS=46 FAIL=0 SKIP=1 (3.9s) dialect=posix` → `RESULT: PASS` | ~4s |
-  | `node test/run-tests.mjs --dialect=windows --skip-slow` | `total: PASS=45 FAIL=0 SKIP=4 (3.8s) dialect=windows` → `RESULT: PASS` | ~4s |
-  | `node test/run-tests.mjs --skip-plugin --skip-slow` | `total: PASS=61 FAIL=0 SKIP=6 (4.1s) dialect=both` → `RESULT: PASS` | ~4s |
+  | `node test/run-tests.mjs` | `total: PASS=87 FAIL=0 SKIP=3 (38.5s) dialect=both` → `RESULT: PASS` | ~39s |
+  | `node test/run-tests.mjs --dialect=posix --skip-slow` | `total: PASS=47 FAIL=0 SKIP=1 (3.9s) dialect=posix` → `RESULT: PASS` | ~4s |
+  | `node test/run-tests.mjs --dialect=windows --skip-slow` | `total: PASS=46 FAIL=0 SKIP=4 (3.9s) dialect=windows` → `RESULT: PASS` | ~4s |
+  | `node test/run-tests.mjs --skip-plugin --skip-slow` | `total: PASS=62 FAIL=0 SKIP=6 (4.2s) dialect=both` → `RESULT: PASS` | ~4s |
   | `node test/plugin-smoke-windows.mjs` | `total: PASS=13 FAIL=0 (1.8s)` | ~2s |
   | `node test/spike-windows.mjs` | `PASS=18 FAIL=0` | ~3s |
 
-  全量（含 slow 池生命周期套件）是 `total: PASS=86 FAIL=0 SKIP=3 (37s) dialect=both`。
   那 3 个 SKIP 是 `verify-mock-server.mjs` 里 POSIX 形状的检查（见
   `POSIX_ONLY_VERIFICATION`），它们在 `--dialect=posix` 下照常 PASS。
 - 默认方言是 `posix`；`--dialect=both`（默认）会用同一个假服务器实现**先后**跑两遍

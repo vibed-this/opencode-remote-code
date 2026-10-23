@@ -72,21 +72,42 @@ export function resolveRemotePath(
  * Every reason string maps to one actionable sentence: the model cannot see
  * *why* a listing/search stopped unless we say so, and "no results" must never
  * be reported when the traverse was cut short.
+ *
+ * `tool` matters because the two callers share one budget vocabulary but not the
+ * wording: `glob` lists paths (nothing is "searched"), `grep` reads files.
  */
-export function truncationNote(reason: string | undefined, detail?: string): string {
+export function truncationNote(
+  reason: string | undefined,
+  detail?: string,
+  tool: "glob" | "grep" = "grep"
+): string {
   const suffix = detail ? ` (${detail})` : ""
+  const listing = tool === "glob"
   switch (reason) {
+    case "cap":
+      return `(Listing truncated: showing the first ${detail ?? "N"} entries. Pass a more specific pattern or a smaller "path".)`
     case "matches":
       return `(Results truncated: showing the first ${detail ?? "N"} matches. Use a more specific pattern or a smaller path.)`
     case "bytes":
       return `(Search stopped after reading the byte budget${suffix}. Restrict "include" or the search path.)`
     case "time":
-      return `(Search stopped on the time budget${suffix}. Narrow the search path or pattern.)`
+      return listing
+        ? `(Listing stopped on the time budget${suffix}. Pass a smaller "path" that is closer to the files you want.)`
+        : `(Search stopped on the time budget${suffix}. Narrow the search path or pattern.)`
     case "walk":
+      // The traversal, not the read loop, was the limiting factor: report what
+      // was actually achieved so "no matches" is not misread as "not present".
+      return listing
+        ? `(Listing was truncated while walking${suffix}. Pass a smaller "path" to narrow the tree.)`
+        : `(Search ended after the traversal was truncated${suffix} — matches may be missing. Narrow "path" or "include".)`
     case "entries":
-      return `(Directory listing was truncated${suffix}. Pass a smaller "path" or a more specific pattern.)`
+      return listing
+        ? `(Directory listing was truncated${suffix}. Pass a smaller "path" or a more specific pattern.)`
+        : `(Search stopped: the traversal hit the entry budget${suffix}. Narrow "path" or "include".)`
     case "depth":
-      return `(Maximum traversal depth reached${suffix}. Search a deeper subdirectory directly.)`
+      return listing
+        ? `(Maximum traversal depth reached${suffix}. Look in a deeper subdirectory directly.)`
+        : `(Maximum traversal depth reached${suffix}. Search a deeper subdirectory directly.)`
     default:
       return `(Results truncated${suffix}.)`
   }

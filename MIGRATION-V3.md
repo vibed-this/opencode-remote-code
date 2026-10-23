@@ -124,7 +124,13 @@ detection probe is only used for the home directory, and a probe failure is no l
         "timeout": 120000,                                 // default `shell` tool timeout (ms)
         "ignore": ["node_modules", ".git"],                // EXTENDS the built-in list
         "limits": { "globResults": 100, "searchMatches": 100, "walkDepth": 12 },
-        "pool": { "command": 3, "file": 2, "stagger": 0 }
+        "pool": { "command": 3, "file": 4, "stagger": 0 },
+
+        // --- activation (3.0.1, optional) ---------------------------------
+        // Register the remote tools ONLY inside these local directories; every
+        // other directory stays dormant, i.e. keeps the native local tools.
+        // Absent/empty = always active.
+        "activateIn": "~/.opencode/remote-sessions"
       }
     }
   ]
@@ -212,7 +218,7 @@ stat/read/write/mkdirp/unlink/rename surface).
 | --- | --- | --- |
 | `shell` description | always "bash" | names the real shell (`bash`, `PowerShell 5.1`, `PowerShell 7 (pwsh)`), so the model stops writing `ls -la` on Windows |
 | `glob` | remote `rg --files --sortr=modified`, `find` fallback | bounded SFTP walk (depth 12, 20 000 entries, 100 results), still newest-first, braces supported |
-| `grep` | remote `rg --json`, `grep -Ern` fallback | bounded SFTP read + JavaScript `RegExp`; `(?i)` only as a leading flag; 100 matches / 64 MiB / 2 MiB per file / 20 s |
+| `grep` | remote `rg --json`, `grep -Ern` fallback | bounded SFTP read + JavaScript `RegExp`; `(?i)` only as a leading flag; 100 matches / 64 MiB / 2 MiB per file / 45 s |
 | `grep` result order | rg/find order | walk order (path ascending), **not** mtime |
 | binaries | `file`, `dd`+`od` sniff | extension blacklist, then a NUL byte in the first 8 KiB |
 | `read` on a directory | `ls -1pA` | SFTP `readdir`; `/` for directories, `@` for symlinks |
@@ -248,3 +254,20 @@ opencode run --standalone --print-logs "print the remote working directory"
 - `shell` should answer with the platform's own command (`Get-Location` on Windows, `pwd` on
   POSIX) — if the tool description still says `bash` on a Windows remote, an old `dist/` is
   being loaded.
+
+---
+
+## 10. 3.0.1 (additive, no breaking changes)
+
+Everything here is backward compatible; an unchanged 3.0.0 config behaves exactly as before except
+for the new defaults below.
+
+| Change | Detail |
+| --- | --- |
+| **`activateIn`** (new) | Scope activation to local directories. All seven tools are name overrides, so an active plugin means the session has **no** local tools; with `"activateIn": "~/.opencode/remote-sessions"` the plugin registers them only in launcher session directories and stays dormant elsewhere, giving you remote **and** local use from one config. Accepts a string or an array, expands `~`, matches boundary-safely (case-insensitive on Windows only), and treats a missing session directory as *outside*. Absent/empty = always active. |
+| Traversal budget | `limits.searchMillis` 20 000 → **45 000 ms**, shared by `grep`'s read loop and the `glob`/`grep` walk. Measured on a tunnelled link: 0.3–0.8 s per SFTP round trip, so 20 s ran out before a large tree was even listed. |
+| File pool | `pool.file` 2 → **4**. `walk()` issues up to 8 concurrent `readdir` requests; two connections serialised almost all of them. |
+| Ignore list | Adds volume-root noise: `$RECYCLE.BIN`, `System Volume Information`, `Windows.old`, `.pnpm-store`, `.Trash`. A remote workspace is often the login home or a whole drive. |
+| Truncation wording | `glob` and `grep` no longer share one sentence: a listing says "Listing…", a search says "Search…". Truncation caused by the **traversal** is now reported separately (`walkTruncated` / `walkReason` on `SearchResult`), so "0 files scanned" no longer masquerades as "the search was too slow". |
+| System prompt | Names the remote workspace explicitly, tells the model to pass `path` to `glob`/`grep` instead of walking the root, and states that any absolute path — including other Windows volumes (`D:/`, `F:/`) — is reachable. |
+| `describeRemoteConfig` | Adds `scope=always|<paths>` to the logged config summary. |

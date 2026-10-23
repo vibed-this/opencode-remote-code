@@ -58,12 +58,26 @@ export interface RemoteConfig {
   timeout: number
   /** SSH connection pool sizing (replaces REMOTE_POOL_* env vars). */
   pool: { command: number; file: number; stagger: number }
+  /**
+   * Local directories where the plugin is allowed to activate at all.
+   *
+   * Empty = always active (the historical behaviour). Non-empty = the plugin
+   * only registers its tools when the session's local directory is inside one of
+   * these prefixes, so a single global config can mean "remote tools inside
+   * `~/.opencode/remote-sessions/*`, native local tools everywhere else".
+   * The seven tools are name-overrides, so without this there is no way to reach
+   * local files in the same session.
+   */
+  activateIn: string[]
 }
 
 /** Default SSH connection pool sizing (V2's REMOTE_POOL_* defaults). */
 export const DEFAULT_POOL: Readonly<RemoteConfig["pool"]> = Object.freeze({
   command: 3,
-  file: 2,
+  // 4, not 2: `walk()` issues up to 8 concurrent readdirs, and over a tunnelled
+  // link (0.3–0.8 s per round trip) a 2-connection file pool serialised almost
+  // all of that work.
+  file: 4,
   stagger: 0,
 })
 
@@ -87,6 +101,7 @@ const OPTION_KEYS = {
   limits: ["limits"],
   timeout: ["timeout"],
   pool: ["pool"],
+  activateIn: ["activateIn", "activate-in"],
 } as const
 
 /**
@@ -819,6 +834,8 @@ export function loadConfig(options?: Record<string, unknown>): RemoteConfig | nu
 
   const pool = resolvePool(opts["pool"])
 
+  const activateIn = resolveActivateIn(readRaw(opts, OPTION_KEYS.activateIn)?.value)
+
   // Not validated here on purpose: the remote platform is unknown until
   // `detect.ts` has probed it (drive-absolute for Windows, "/x" for POSIX).
   const workdir = readString(opts, OPTION_KEYS.workdir)
@@ -840,7 +857,53 @@ export function loadConfig(options?: Record<string, unknown>): RemoteConfig | nu
     limits,
     timeout,
     pool,
+    activateIn,
   }
+}
+
+/**
+ * Normalise the local directories the plugin may activate in.
+ *
+ * Accepts a single string or an array, expands `~`, resolves relative entries
+ * against the current working directory and drops a trailing separator so
+ * prefix matching stays boundary-safe (`C:/a/b/` -> `C:/a/b`).
+ */
+export function resolveActivateIn(raw: unknown): string[] {
+  const items = Array.isArray(raw) ? raw : raw === undefined || raw === null ? [] : [raw]
+  const out: string[] = []
+  for (const item of items) {
+    if (typeof item !== "string" || item.trim() === "") continue
+    const resolved = path.resolve(expandHome(item.trim()))
+    out.push(resolved.length > 1 ? resolved.replace(/[\\/]+$/, "") : resolved)
+  }
+  return out
+}
+
+/**
+ * Is `directory` inside (or equal to) one of the `activateIn` roots?
+ *
+ * Boundary-safe and case-insensitive on Windows (the session directory arrives
+ * with whatever casing the shell used: `c:/users/…` vs `C:/Users/…`), and the
+ * extended-length `\\?\` prefix is stripped first. A missing directory is
+ * "outside": guessing would silently strip the session's local tools.
+ */
+export function isWithinActivateIn(roots: string[], directory: string | undefined): boolean {
+  if (typeof directory !== "string" || directory.trim() === "") return false
+
+  const fold = (value: string): string => {
+    const stripped = value.replace(/^\\\\\?\\/, "").replace(/[\\/]+$/, "")
+    const resolved = path.resolve(stripped === "" ? value : stripped)
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved
+  }
+
+  const target = fold(directory)
+  for (const root of roots) {
+    const base = fold(root)
+    if (target === base) return true
+    const relative = path.relative(base, target)
+    if (relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative)) return true
+  }
+  return false
 }
 
 function parsePlatform(value: string | undefined): RemoteConfig["platform"] {
@@ -923,6 +986,7 @@ export function describeRemoteConfig(config: RemoteConfig): string {
     `mirror=${config.mirrorRoot}`,
     `timeout=${config.timeout}ms`,
     `pool=${config.pool.command}/${config.pool.file}/${config.pool.stagger}`,
+    `scope=${config.activateIn.length === 0 ? "always" : config.activateIn.join(",")}`,
     `debug=${config.debug ? "on" : "off"}`
   )
   if (config.extraOptions.length > 0) {

@@ -2,7 +2,7 @@ import fs from "fs/promises"
 import { Plugin } from "@opencode/plugin"
 import type { SFTPWrapper } from "ssh2"
 
-import { describeRemoteConfig, loadConfig } from "./config.js"
+import { describeRemoteConfig, isWithinActivateIn, loadConfig } from "./config.js"
 import { createLogger } from "./log.js"
 import { createDialect } from "./platform/dialect.js"
 import { detectRemote } from "./platform/detect.js"
@@ -55,6 +55,24 @@ export default Plugin.define({
     const logger = createLogger(config.debug)
     await logger.log("Plugin loaded")
     await logger.log(describeRemoteConfig(config))
+
+    // ---------------------------------------------------------------------
+    // 1b. cwd scope (`activateIn`, see README "local and remote in one config").
+    //     The seven tools are NAME OVERRIDES, so an active plugin means the
+    //     session has no local file access at all. Scoping activation to the
+    //     launcher's session directory is what lets one global config give you
+    //     remote tools there and OpenCode's native tools everywhere else.
+    // ---------------------------------------------------------------------
+    if (config.activateIn.length > 0) {
+      const directory = ctx.location?.directory
+      if (!isWithinActivateIn(config.activateIn, directory)) {
+        await logger.log(
+          `dormant: session directory ${directory ?? "(unknown)"} is outside activateIn=${config.activateIn.join(",")}`
+        )
+        return
+      }
+      await logger.log(`activated in ${directory}`)
+    }
 
     // ---------------------------------------------------------------------
     // 2. Transport + platform detection (DESIGN-V3 §6.4).

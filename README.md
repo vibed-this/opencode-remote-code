@@ -273,7 +273,8 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | Ignore names | `ignore` | **extends** the built-in list (never replaces it) |
 | Tool limits | `limits` | see below |
 | Default `shell` timeout | `timeout` | `120000` ms |
-| Connection pool | `pool` | `{ "command": 3, "file": 2, "stagger": 0 }` |
+| Connection pool | `pool` | `{ "command": 3, "file": 4, "stagger": 0 }` |
+| Activation scope | `activateIn`, `activate-in` | `[]` = always on; else a local directory (or array) — see [Local and remote in one config](#local-and-remote-in-one-config-activatein) |
 
 `limits` keys and defaults (`src/limits.ts`; numbers may also be written as strings):
 
@@ -283,17 +284,61 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | `searchMatches` | `100` | `grep` match cap |
 | `searchBytes` | `67108864` (64 MiB) | `grep` total bytes actually read |
 | `searchFileSize` | `2097152` (2 MiB) | `grep` per-file skip threshold |
-| `searchMillis` | `20000` | `grep` wall clock |
+| `searchMillis` | `45000` | `grep` wall clock + the `glob`/`grep` traversal budget |
 | `walkDepth` | `12` | `glob` + `grep` traversal depth |
 | `walkEntries` | `20000` | `glob` + `grep` directory entries visited |
 | `shellTimeout` | `120000` | `shell` (overridden by the `timeout` option) |
 
-Built-in ignore names (15, matched against the directory *name* at any depth): `node_modules`,
+Built-in ignore names (20, matched against the directory *name* at any depth): `node_modules`,
 `.git`, `.hg`, `.svn`, `dist`, `build`, `out`, `target`, `.venv`, `venv`, `vendor`, `__pycache__`,
-`.next`, `.cache`, `.turbo`. Matching is case-insensitive only when the remote is Windows.
+`.next`, `.cache`, `.turbo`, plus the volume-root noise `$RECYCLE.BIN`,
+`System Volume Information`, `Windows.old`, `.pnpm-store`, `.Trash`. Matching is case-insensitive
+only when the remote is Windows. The last five matter because a remote workspace is often the login
+home — or a whole drive — where those trees hold tens of thousands of unrelated entries.
 
 Removed keys still get one loud message: `sudoPassword` → `console.warn` (the plugin never
 escalates privileges); `jump` / `proxyJump` / `proxyCommand` → hard error.
+
+### Local and remote in one config (`activateIn`)
+
+All seven tools are **name overrides**, so while the plugin is active the session has **no local file
+access at all** — there is no second `read` pointing at your own disk. That is fine for a dedicated
+remote config, but it is what makes a single global `opencode.jsonc` awkward: turn the remote on and
+your local projects lose their native tools.
+
+`activateIn` scopes activation to **local directories**, so one config can do both:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "C:/Users/you/.config/opencode/remote-code",
+      "options": {
+        "ssh": "ssh -p 48713 you@example.com",
+        "workdir": "C:/Users/you/proj",
+        "password": "***",
+        "activateIn": "~/.opencode/remote-sessions"
+      }
+    }
+  ]
+}
+```
+
+- Inside one of the prefixes → the seven remote tools register as usual.
+- Outside → `setup()` logs one line and returns: the plugin is **dormant**, and OpenCode's native
+  local tools are exactly what the model sees.
+- Accepts a string or an array, expands `~`, ignores trailing separators.
+- Matching is **boundary-safe** (`…/remote-sessions-archive` is *not* inside `…/remote-sessions`) and
+  case-insensitive on Windows only.
+- A missing session directory counts as **outside** — guessing would silently strip a session's local
+  tools.
+- Absent/empty = always active (the 3.0.0 behaviour).
+
+It pairs with the launchers, which pin a stable local session directory per target
+(`~/.opencode/remote-sessions/<host>_<workdir-slug>/`): remote tools inside launcher sessions, native
+local tools everywhere else, from **one** config. There is deliberately no `coexist: true` mode that
+registers the tools without overriding them — two same-named tools make the model pick one at random
+and then run it on the wrong machine.
 
 ### Windows remotes and `workdir`
 
@@ -403,7 +448,9 @@ foreign manifest costs one re-transfer, nothing else. The whole namespace is wip
 
 - **Command pool** (`pool.command`, default 3): `shell` execution plus the one-shot `where.exe pwsh`
   probe.
-- **File pool** (`pool.file`, default 2): every SFTP session.
+- **File pool** (`pool.file`, default 4): every SFTP session. It is 4, not 2, because `walk()` issues
+  up to 8 concurrent `readdir` requests — over a tunnelled link (0.3–0.8 s per round trip) a
+  2-connection pool serialised almost all of that work.
 - **`pool.stagger`** (default 0 ms) delays sequential handshakes for servers that dislike bursts.
 
 `"debug": true` appends to `~/.opencode/remote-code-debug.log`; nothing secret is ever logged
@@ -421,7 +468,7 @@ V2).
 | :--- | :--- | :--- | :--- |
 | `shell` | SSH exec (dialect) | `workdir` defaults to the workspace root; a timeout is reported as its own failure (`Command timed out after <n>ms`), distinct from a non-zero exit; the exit code is authoritative | `timeout` (default 120 s) |
 | `glob` | SFTP walk | `*`, `?`, `**`, `**/`, `{a,b}`, `[abc]`/`[!abc]`; a pattern without `/` matches the basename; backslashes are separators; newest-first (mtime desc) | depth 12 / 20 000 entries / 100 results |
-| `grep` | SFTP read | JavaScript `RegExp` dialect; leading `(?i)` / `(?m)` / `(?s)` lifted into flags; `include` is a glob on the walk-relative path; results in walk order, grouped per file as `Line <n>: <text>` | 100 matches / 64 MiB / 2 MiB per file / 20 s |
+| `grep` | SFTP read | JavaScript `RegExp` dialect; leading `(?i)` / `(?m)` / `(?s)` lifted into flags; `include` is a glob on the walk-relative path; results in walk order, grouped per file as `Line <n>: <text>` | 100 matches / 64 MiB / 2 MiB per file / 45 s |
 | `read` | SFTP + mirror | `stat` → directory? `readdir` listing (`/` for dirs, `@` for symlinks) → missing? same-directory "did you mean" → binary gate (NUL in the first 8 KiB + extension blacklist) → `ensureLocal` → read the local copy so it is byte-identical to what `write`/`edit` will see | 2000 lines, 50 KB output, 2000 chars/line |
 | `write` | mirror + per-file push | Keeps the file's own line ending (a new file gets `\n`), preserves BOM, shows a unified-diff preview in the permission request | — |
 | `edit` | mirror + per-file push | Full OpenCode-native replacer set, per-file lock, CRLF preserved | — |

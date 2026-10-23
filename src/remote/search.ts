@@ -53,6 +53,16 @@ export interface SearchResult {
   matches: SearchMatch[]
   truncated: boolean
   reason?: "matches" | "bytes" | "time" | "walk"
+  /**
+   * The listing itself was cut short (depth / entries / time), independent of
+   * `reason`: candidates that were never listed cannot be searched, so results
+   * may be incomplete even when the read loop finished cleanly.
+   */
+  walkTruncated: boolean
+  /** Why the walk stopped, when `walkTruncated` — lets the caller say which. */
+  walkReason?: "entries" | "time" | "depth"
+  /** Directory entries visited by the walk (files + dirs), for honest wording. */
+  walkEntries: number
   /** Bytes actually transferred. */
   scannedBytes: number
   /** Files actually read. */
@@ -67,7 +77,9 @@ export const SEARCH_DEFAULTS = {
   maxMatches: 100,
   maxBytes: 64 * 1024 * 1024,
   maxFileSize: 2 * 1024 * 1024,
-  maxMillis: 20_000,
+  // 45 s (not 20 s): over SFTP each directory costs a round trip, and a linked
+  // (tunnelled) remote takes 0.3–0.8 s per round trip.
+  maxMillis: 45_000,
 } as const
 
 /** How much of a file is inspected for NUL bytes. */
@@ -220,6 +232,18 @@ export async function searchFiles(
   let truncated = false
   let reason: SearchResult["reason"]
 
+  const walkTruncated = walkResult.truncated
+  const walkReason = walkResult.reason
+  const walkEntries = walkResult.entries
+
+  /**
+   * Blame the right budget. If the *listing* was already cut short and nothing
+   * has been read yet, the honest reason is the walk — reporting "time" there
+   * produced "0 files scanned" plus a message about narrowing the search.
+   */
+  const stopReasonForTime = (): NonNullable<SearchResult["reason"]> =>
+    walkTruncated && scannedFiles === 0 ? "walk" : "time"
+
   let stopped = false
   let matchCapHit = false
   const stopFor = (why: NonNullable<SearchResult["reason"]>): void => {
@@ -270,7 +294,7 @@ export async function searchFiles(
   const fill = (): void => {
     while (!stopped && inFlight.length < window && nextIndex < candidates.length) {
       if (Date.now() - startedAt > maxMillis) {
-        stopFor("time")
+        stopFor(stopReasonForTime())
         return
       }
       const candidate = candidates[nextIndex] as Candidate
@@ -294,7 +318,7 @@ export async function searchFiles(
   // hand are still scanned (their bytes are already paid for).
   while (inFlight.length > 0) {
     if (Date.now() - startedAt > maxMillis) {
-      stopFor("time")
+      stopFor(stopReasonForTime())
       break
     }
     const entry = inFlight.shift() as PendingRead
@@ -340,7 +364,7 @@ export async function searchFiles(
   // the caller's back.
   await Promise.allSettled(inFlight.map((entry) => entry.promise))
 
-  if (!truncated && walkResult.truncated) {
+  if (!truncated && walkTruncated) {
     // The listing itself was cut short (depth/entries/time) — the caller must
     // tell the model, otherwise "no matches" would be a lie.
     stopFor("walk")
@@ -350,6 +374,9 @@ export async function searchFiles(
     matches,
     truncated,
     reason,
+    walkTruncated,
+    walkReason,
+    walkEntries,
     scannedBytes,
     scannedFiles,
     skippedBinary,

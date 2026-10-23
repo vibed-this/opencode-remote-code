@@ -254,7 +254,8 @@ POSIX 主机把 `Copy-Item` 换成 `cp -r`，其余相同。
 | ignore 名单 | `ignore` | **追加**到内置名单（不会替换） |
 | 工具限额 | `limits` | 见下表 |
 | `shell` 默认超时 | `timeout` | `120000` ms |
-| 连接池 | `pool` | `{ "command": 3, "file": 2, "stagger": 0 }` |
+| 连接池 | `pool` | `{ "command": 3, "file": 4, "stagger": 0 }` |
+| 激活作用域 | `activateIn`、`activate-in` | `[]` = 永远激活；否则为一个本地目录或目录数组（见下文「本地与远端共用一份配置」） |
 
 `limits` 键与默认值（`src/limits.ts`；数字也可写成字符串）：
 
@@ -264,17 +265,56 @@ POSIX 主机把 `Copy-Item` 换成 `cp -r`，其余相同。
 | `searchMatches` | `100` | `grep` 命中上限 |
 | `searchBytes` | `67108864`（64 MiB） | `grep` 实际读取总量 |
 | `searchFileSize` | `2097152`（2 MiB） | `grep` 单文件跳过阈值 |
-| `searchMillis` | `20000` | `grep` 墙钟时间 |
+| `searchMillis` | `45000` | `grep` 墙钟时间 + `glob`/`grep` 的遍历预算 |
 | `walkDepth` | `12` | `glob` + `grep` 遍历深度 |
 | `walkEntries` | `20000` | `glob` + `grep` 访问的目录项数 |
 | `shellTimeout` | `120000` | `shell`（被 `timeout` 覆盖） |
 
-内置 ignore 名单（15 项，按任意深度的目录**名**匹配）：`node_modules`、`.git`、`.hg`、`.svn`、
+内置 ignore 名单（20 项，按任意深度的目录**名**匹配）：`node_modules`、`.git`、`.hg`、`.svn`、
 `dist`、`build`、`out`、`target`、`.venv`、`venv`、`vendor`、`__pycache__`、`.next`、`.cache`、
-`.turbo`。仅在远端为 Windows 时大小写不敏感。
+`.turbo`，以及卷根噪音 `$RECYCLE.BIN`、`System Volume Information`、`Windows.old`、
+`.pnpm-store`、`.Trash`。仅在远端为 Windows 时大小写不敏感。后五项存在的原因：远端工作区经常
+就是登录 home（甚至整个盘），这些目录里塞着上万条无关条目，会把遍历预算烧在无关的树上。
 
 已删除的键仍会得到一次明确提示：`sudoPassword` → `console.warn`（插件从不提权）；
 `jump` / `proxyJump` / `proxyCommand` → 硬报错。
+
+### 本地与远端共用一份配置（`activateIn`）
+
+七个工具都是**按名覆盖内置工具**，所以插件一旦活跃，这个会话就**完全没有本地文件访问能力**
+——不存在第二个指向你自己磁盘的 `read`。对专用远端配置这没问题，但正因如此，一份全局
+`opencode.jsonc` 会很难受：远端一开，本地项目的原生工具就没了。
+
+`activateIn` 把「是否激活」收敛到**本地目录作用域**，于是一份配置能两头兼顾：
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "C:/Users/WIN11/.config/opencode/remote-code",
+      "options": {
+        "ssh": "ssh -p 48713 you@example.com",
+        "workdir": "C:/Users/you/proj",
+        "password": "***",
+        "activateIn": "~/.opencode/remote-sessions"
+      }
+    }
+  ]
+}
+```
+
+- 会话目录在其前缀之内 → 七个远端工具照常注册。
+- 之外 → `setup()` 打一行日志就返回：插件**休眠**，模型看到的就是 OpenCode 原生本地工具。
+- 接受单个字符串或数组，展开 `~`，忽略尾部分隔符。
+- 匹配是**边界安全**的（`…/remote-sessions-archive` **不**算在 `…/remote-sessions` 之内），
+  且仅在 Windows 上大小写不敏感。
+- 拿不到会话目录时一律判为**外部**——猜错会静默剥掉会话的本地工具。
+- 缺省/空数组 = 永远激活（3.0.0 的行为）。
+
+它与启动脚本天然咬合：脚本按「主机 + 远端目录」固定一个本地会话目录
+（`~/.opencode/remote-sessions/<host>_<workdir-slug>/`），于是**一份**配置就能做到「启动脚本
+起的会话里是远端工具，其它目录全是原生本地工具」。故意**不**提供 `coexist: true`（注册但不
+覆盖）模式：两套同名工具会让模型随机挑一个，然后在错的机器上执行。
 
 ### Windows 远端与 `workdir`
 
@@ -377,7 +417,8 @@ commit(remote)        读本地 → SFTP mkdirp(父目录) → writeFile → sta
 `ssh2` 连接池，无任何外部二进制：
 
 - **命令池**（`pool.command`，默认 3）：`shell` 执行，外加一次性的 `where.exe pwsh` 探测。
-- **文件池**（`pool.file`，默认 2）：所有 SFTP 会话。
+- **文件池**（`pool.file`，默认 4）：所有 SFTP 会话。取 4 而非 2 的原因：`walk()` 会并发发
+  8 个 `readdir`，在隧穿链路上（单次往返 0.3–0.8 s）2 条连接几乎把并发全部串行化了。
 - **`pool.stagger`**（默认 0 ms）：为不喜欢连接突发的服务器拉开握手间隔。
 
 `"debug": true` 追加写入 `~/.opencode/remote-code-debug.log`；绝不记录敏感信息
@@ -394,7 +435,7 @@ commit(remote)        读本地 → SFTP mkdirp(父目录) → writeFile → sta
 | :--- | :--- | :--- | :--- |
 | `shell` | SSH exec（方言） | `workdir` 缺省为工作区根；超时被报成独立的失败（`Command timed out after <n>ms`），与非零退出区分；退出码为准 | `timeout`（默认 120 s） |
 | `glob` | SFTP 遍历 | `*`、`?`、`**`、`**/`、`{a,b}`、`[abc]`/`[!abc]`；不含 `/` 的模式匹配**文件名**；反斜杠视为分隔符；结果按 mtime 降序 | 深度 12 / 20 000 项 / 100 条 |
-| `grep` | SFTP 读取 | JavaScript `RegExp` 方言；开头 `(?i)` / `(?m)` / `(?s)` 提升为 flag；`include` 是对遍历相对路径的 glob；结果按遍历顺序、按文件分组，格式 `Line <n>: <text>` | 100 命中 / 64 MiB / 单文件 2 MiB / 20 s |
+| `grep` | SFTP 读取 | JavaScript `RegExp` 方言；开头 `(?i)` / `(?m)` / `(?s)` 提升为 flag；`include` 是对遍历相对路径的 glob；结果按遍历顺序、按文件分组，格式 `Line <n>: <text>` | 100 命中 / 64 MiB / 单文件 2 MiB / 45 s |
 | `read` | SFTP + 镜像 | `stat` → 是目录？`readdir` 列表（目录带 `/`，符号链接带 `@`）→ 不存在？同目录"你是指"→ 二进制闸门（前 8 KiB 的 NUL + 扩展名黑名单）→ `ensureLocal` → 读**本地**副本，保证与 `write`/`edit` 看到的一致 | 2000 行 / 50 KB 输出 / 每行 2000 字符 |
 | `write` | 镜像 + 单文件推送 | 保留文件自身行尾（新文件用 `\n`），保留 BOM，权限请求里带 unified diff 预览 | — |
 | `edit` | 镜像 + 单文件推送 | 完整的 OpenCode 原生替换器集合，按文件加锁，保留 CRLF | — |

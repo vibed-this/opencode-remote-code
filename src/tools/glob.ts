@@ -89,11 +89,11 @@ export function createGlobTool(ctx: RemoteToolContext): RemoteToolDefinition {
         // Only reached with an empty `lines` when the walk was cut short before
         // finding anything at all — then the note *is* the whole answer.
         if (lines.length > 0) lines.push("")
-        const reason = capped ? "results" : walkResult.reason
+        const reason = capped ? "cap" : (walkResult.reason ?? "walk")
         const detail = capped
-          ? `showing ${shown.length} of ${matched.length} files`
+          ? `${shown.length} of ${matched.length} files`
           : `${walkResult.entries} entries visited`
-        lines.push(truncationNote(reason, detail))
+        lines.push(truncationNote(reason, detail, "glob"))
       } else if (lines.length === 0) {
         lines.push("No files found")
       }

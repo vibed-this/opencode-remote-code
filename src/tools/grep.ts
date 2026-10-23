@@ -103,7 +103,7 @@ export function createGrepTool(ctx: RemoteToolContext): RemoteToolDefinition {
         if (!truncated) {
           lines.push("No files found")
         } else {
-          lines.push(truncationNote(reason, budgetDetail(result)))
+          lines.push(truncationNote(reason, budgetDetail(result), "grep"))
         }
       } else {
         lines.push(`Found ${matches.length} matches${capped ? ` (showing first ${matches.length})` : ""}`)
@@ -124,7 +124,7 @@ export function createGrepTool(ctx: RemoteToolContext): RemoteToolDefinition {
 
         if (truncated) {
           lines.push("")
-          lines.push(truncationNote(reason, budgetDetail(result)))
+          lines.push(truncationNote(reason, budgetDetail(result), "grep"))
         }
       }
 
@@ -150,10 +150,16 @@ function budgetDetail(result: {
   matches: { length: number }
   scannedFiles: number
   scannedBytes: number
+  walkEntries?: number
 }): string {
   if (result.reason === "matches") return String(result.matches.length)
   if (result.reason === "bytes") {
     return `${result.scannedFiles} files scanned, ${Math.round(result.scannedBytes / (1024 * 1024))} MiB read`
+  }
+  if (result.reason === "walk" && typeof result.walkEntries === "number") {
+    // Distinguishes "searched everything and found nothing" from "never got to
+    // read the files you wanted", which is the common case on a drive root.
+    return `${result.scannedFiles} files scanned, ${result.walkEntries} entries visited`
   }
   return `${result.scannedFiles} files scanned`
 }

@@ -76,6 +76,21 @@ export async function buildRemoteSystemPrompt(
   // 3. Dialect instructions — the paragraph that stops `ls -la` on Windows.
   const shellHint = ctx.shellHint.trim()
 
+  // 3b. Workspace-reach note. A remote workspace is frequently the login home
+  //     (or a whole drive), and `glob`/`grep` default to walking it from the
+  //     top: over SFTP that burns the traversal budget on unrelated trees. The
+  //     model can do much better with a scoped `path`, and it can reach other
+  //     volumes by absolute path — neither is guessable from the tool schemas.
+  const reachHint = [
+    `All file tools operate on the remote machine (${ctx.remoteRoot}) — there are no local tools in this session.`,
+    `Pass "path" to narrow "glob"/"grep" whenever you know roughly where to look: they walk the workspace root by`,
+    `default, which is slow and gets truncated on large trees (a login home or a whole drive).`,
+    ctx.platform === "windows"
+      ? `Any absolute path on the remote is reachable, including other volumes (e.g. 'D:/proj', 'F:/data');`
+      : `Any absolute path on the remote is reachable (e.g. '/srv/data', '/etc').`,
+    `paths outside the workspace may ask for permission.`,
+  ].join("\n")
+
   // 4. Remote AGENTS.md (already fetched by the caller over SFTP).
   const agentsMd = (ctx.agentsMd ?? "").trim()
   const agentsSection =
@@ -88,6 +103,7 @@ export async function buildRemoteSystemPrompt(
 
   const parts: string[] = [providerPrompt, envBlock]
   if (shellHint !== "") parts.push(shellHint)
+  parts.push(reachHint)
   if (agentsSection !== "") parts.push(agentsSection)
   if (skillsSection !== undefined && skillsSection.trim() !== "") parts.push(skillsSection)
 
