@@ -208,6 +208,30 @@ return () => controller.abort()
 **未配置时必须保持 dormant**：`setup` 里配置为空就 return，不要连 SSH，不要注册任何工具，
 让 OpenCode 保持本地模式。这一点是硬要求。
 
+## 7.1 本地插件「目录形式」的加载规则（实测 v2.1.0，踩坑记录）
+
+把 `package` 写成仓库/目录路径时，V2 的 `PluginModule` 只探测 `<dir>/server.js` 与
+`<dir>/index.js` 两个入口，**完全忽略 `package.json` 的 `main` / `exports`**。入口不在目录根时：
+一行日志都没有（连 `failed to load plugin` 都不打），插件静默失效。
+
+实测过程（同一台机器，同一份代码）：
+
+| 变体 | 结果 |
+|---|---|
+| 目录只含 `package.json` + `dist/`（`main: dist/index.js`） | 静默跳过，无任何日志 |
+| 目录含根 `index.js`（`export * from "./dist/index.js"`） | `msg="loading plugin"` + 正常加载 |
+| 同上但目录在 `D:`（配置/项目在 `C:`） | 静默跳过（junction 指到 `D:` 同样被跳过，估计被 realpath） |
+| 同上但在 `C:` | 正常加载 |
+| `package` 直接写成 `.../dist/index.js`（文件形式） | 本次未复现成功场景，按目录+根 `index.js` 落地 |
+
+结论（已固化到仓库）：
+
+- 仓库根必须有 `index.js`（本仓库已有，`test/plugin-entry.mjs` 覆盖）。
+- Windows 上安装目录必须和 OpenCode 项目在**同一盘符**；不能靠 junction / 符号链接跨盘。
+- `opencode plugin add` 只吃 npm/git spec，本地目录只能手写进 `plugins`。
+- 插件加载是**懒触发**的：`opencode api ...`、`opencode debug config` 都不会加载插件，
+  必须跑一次真实会话（`opencode run --standalone --print-logs` 最方便观察）。
+
 ## 8. package.json 需要修的地方
 
 1. 上游 `dependencies` 键**写了两遍**，第二个覆盖第一个，导致 `diff` 丢失、`npm run build` 直接失败

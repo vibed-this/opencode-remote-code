@@ -344,9 +344,35 @@ Add the plugin to `opencode.jsonc` — either the built local directory or the p
 }
 ```
 
-`package` points at the directory containing `package.json` + `dist/` (or at a published package name). Restart OpenCode (or the background service) after changing the config. Do **not** rely on copying `dist/` into `~/.config/opencode/plugins/` — that was the V1 workflow.
+`package` points at the directory containing `index.js` + `dist/` (or at a published package name). Restart OpenCode (or the background service) after changing the config.
 
-Unconfigured (`options.ssh` absent and no `REMOTE_SSH`) → plugin dormant, local mode.
+#### How V2 resolves a local plugin directory (measured on v2.1.0)
+
+This is the single most common reason an install "silently does nothing", so read it before reporting a bug:
+
+1. **`package.json` `main` / `exports` are ignored.** For a local path V2 only probes `<dir>/server.js` and `<dir>/index.js` (`PluginModule` → `entrypoint` resolver). Without a root `index.js` the entry is dropped with *no* log line at all — not even `failed to load plugin`. That is why this repo ships a committed root `index.js` shim (`export * from "./dist/index.js"`); `test/plugin-entry.mjs` guards it.
+2. **The path must be absolute and on a drive V2 actually probes.** On Windows, a plugin directory on a *different drive* than the project/config is ignored the same silent way (measured: identical copy loads from `C:\…`, never attempted from `D:\…`; a junction on `C:` pointing to `D:` is ignored too, because it is realpath'd). Install a real copy on the same drive you run OpenCode from.
+3. **Config `plugins[].options` only reach the plugin when the entry is an object** (`{ "package": …, "options": { … } }`). Auto-discovered plugins under `.opencode/plugins/` get `options: {}`.
+4. **Loading is lazy.** `opencode api …` / `opencode debug config` do *not* load plugins; a real `opencode run` (or the TUI) does. Log in the plugin's own `~/.opencode/remote-code-debug.log`, or run `opencode run --standalone --print-logs` and look for `msg="loading plugin"`.
+
+`opencode plugin add` only accepts npm/Git specs, so a local checkout must be listed in `plugins` by hand.
+
+#### Copy install (stable, works across drives)
+
+Referencing the checkout directly is fine while it lives on the same drive as OpenCode. For a stable install, copy the built artifacts next to the global config and install the runtime deps there:
+
+```powershell
+$dst = "$env:USERPROFILE\.config\opencode\remote-code"
+New-Item -ItemType Directory -Force -Path $dst | Out-Null
+Copy-Item <repo>\index.js,<repo>\package.json -Destination $dst
+Copy-Item <repo>\dist -Destination $dst -Recurse
+Copy-Item <repo>\launchers -Destination $dst -Recurse
+cd $dst; npm install --omit=dev   # ssh2 + diff (peer dep @opencode/plugin comes from the host)
+```
+
+Then point `plugins[].package` at `$dst`. Do **not** put the copy under `~/.config/opencode/plugins/` — that directory is auto-discovered, so the plugin would load twice (once without options).
+
+Unconfigured (`options.ssh` absent and no `REMOTE_SSH`) → plugin dormant, local mode: no tools, no SSH, no files written.
 
 ### Usage with Launcher
 

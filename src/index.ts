@@ -21,13 +21,21 @@ import {
   type RemoteToolDefinition,
 } from "./v2-bridge.js"
 
-const LOG_FILE = path.join(os.homedir(), ".opencode", "remote-code-debug.log")
+const LOG_DIR = path.join(os.homedir(), ".opencode")
+const LOG_FILE = path.join(LOG_DIR, "remote-code-debug.log")
 
 /** Debug logging is opt-in (REMOTE_CODE_DEBUG=1) unless remote mode is active. */
 let debugEnabled = process.env.REMOTE_CODE_DEBUG === "1"
+/** `~/.opencode` does not necessarily exist yet (custom `mirror` option, first run). */
+let logDirReady = false
 
 async function logDebug(msg: string) {
   if (!debugEnabled) return
+  if (!logDirReady) {
+    // Without this the append fails with ENOENT and the log silently stays empty.
+    await fs.mkdir(LOG_DIR, { recursive: true }).catch(() => {})
+    logDirReady = true
+  }
   const line = `[${new Date().toISOString()}] ${msg}\n`
   await fs.appendFile(LOG_FILE, line).catch(() => {})
 }

@@ -3,7 +3,7 @@
  *
  *   1. wipes and recreates test/tmp/{remote,local,mirror}
  *   2. runs the standalone unit suites as child processes
- *      (test/path-mapper.mjs, test/ssh-pool-lifecycle.mjs)
+ *      (test/path-mapper.mjs, test/plugin-entry.mjs, test/ssh-pool-lifecycle.mjs)
  *   3. starts the mock SSH server (test/mock-ssh-server.mjs)
  *   4. runs the mock-server verification (test/verify-mock-server.mjs)
  *   5. runs the plugin smoke test (test/plugin-smoke.mjs) when dist/index.js exists
@@ -43,6 +43,7 @@ const skipSlow = args.has("--skip-slow")
  */
 const UNIT_SUITES = [
   { script: "path-mapper.mjs", label: "path-mapper suite", slow: false },
+  { script: "plugin-entry.mjs", label: "plugin entry suite", slow: false },
   { script: "ssh-pool-lifecycle.mjs", label: "ssh-pool lifecycle suite", slow: true },
 ]
 
