@@ -1,60 +1,55 @@
 @echo off
 setlocal EnableExtensions
-REM Launcher for OpenCode with the Remote Code plugin (Windows CMD, OpenCode V2).
+REM Launcher for OpenCode with the Remote Code plugin (Windows CMD, plugin 3.x, OpenCode V2).
 REM
-REM IMPORTANT (V2): the real remote configuration lives in opencode.jsonc, under
-REM the plugin's "options":
+REM The remote target is configured ONLY by the plugin "options" in
+REM opencode.jsonc:
 REM
 REM   "plugins": [{
-REM     "package": "D:/path/to/opencode-remote-code",
+REM     "package": "C:/Users/you/.config/opencode/remote-code",
 REM     "options": {
-REM       "ssh": "ssh -oHostKeyAlgorithms=+ssh-rsa user@192.0.2.10",
-REM       "workdir": "/home/project",
+REM       "ssh": "ssh -p 48713 you@192.0.2.10",
+REM       "workdir": "C:/Users/you/project",   // optional: defaults to the login home
 REM       "password": "changeme"
 REM     }
 REM   }]
 REM
-REM V2 plugins run inside a shared BACKGROUND service that does not inherit your
-REM shell environment, so setting REMOTE_* here is normally not enough to
-REM activate remote mode. Only "opencode run --standalone" (a private service
-REM process) inherits these variables. See PORTING-NOTES.md for a working config.
+REM Since 3.0.0 the REMOTE_* environment variables were deleted (the plugin runs
+REM inside a shared background service that does not inherit your shell, so they
+REM were never reliable). Nothing here can configure the remote -- see AGENTS.md
+REM and MIGRATION-V3.md.
 REM
-REM What this script still does: it pins a stable local working directory
-REM derived from the remote target, so OpenCode sessions do not "disappear" when
-REM you launch from different folders (OpenCode binds sessions to process.cwd()).
+REM What this script does: it pins a stable local working directory derived from
+REM the remote target, so OpenCode sessions do not "disappear" when you launch
+REM from different folders (OpenCode binds sessions to process.cwd()).
 REM
 REM Usage:
 REM   remote-opencode.bat
-REM   remote-opencode.bat --ssh "ssh user@192.0.2.10" --workdir /home/project
+REM   remote-opencode.bat --ssh "ssh user@192.0.2.10" --workdir C:/Users/x/proj
 REM
 REM --ssh / --workdir win over environment variables; unparsed arguments are
-REM forwarded to opencode unchanged.
+REM forwarded to opencode unchanged. Both values are used for the session
+REM directory name only (the workdir may be a Windows or a POSIX remote path).
 
 chcp 65001 >nul
 
 REM ==========================
 REM === User Configuration ===
 REM ==========================
-REM Optional. Prefer the opencode.jsonc plugin options for the actual remote
-REM target; the values below only affect the local session directory name and
-REM the legacy REMOTE_* exports.
+REM Optional. The remote itself is configured in opencode.jsonc; the values
+REM below only decide the local session directory.
 REM
 REM Uncomment and edit to pin a target here instead of using the environment.
 REM 192.0.2.0/24 is the RFC 5737 documentation range (never a real device) and
 REM "changeme" is an obvious placeholder. YOU MUST REPLACE THESE VALUES.
 REM
-REM set "REMOTE_SSH=ssh -oHostKeyAlgorithms=+ssh-rsa user@192.0.2.10"
-REM set "REMOTE_WORKDIR=/home/project"
+REM set "REMOTE_SSH=ssh -p 48713 user@192.0.2.10"
+REM set "REMOTE_WORKDIR=C:/Users/x/project"
 REM set "REMOTE_PASSWORD=changeme"
-REM set "REMOTE_SUDO_PASSWORD=changeme"
 REM ==========================
 
-REM SSH connection pool tuning (environment only, uncomment in your shell).
-REM These are still read from process.env, so they inherit the same V2 caveat as
-REM the REMOTE_* variables above (reliable only with "opencode run --standalone").
-REM set "REMOTE_POOL_COMMAND_SIZE=3"
-REM set "REMOTE_POOL_FILE_SIZE=2"
-REM set "REMOTE_POOL_STAGGER_MS=0"
+REM Connection pool sizing is a plugin option now ("options.pool" = { command,
+REM file, stagger }); it is no longer read from the environment.
 
 REM Optional CLI arguments: --ssh ^<command^> / --workdir ^<path^>.
 REM Anything else (including everything after "--") is forwarded to opencode.
@@ -100,9 +95,56 @@ if defined HOST_ONLY for /f "tokens=1 delims=: " %%a in ("%HOST_ONLY%") do set "
 if not defined HOST_ONLY set "HOST_ONLY=unknown"
 
 if not defined REMOTE_WORKDIR goto no_workdir
-set "DIR_SLUG=%REMOTE_WORKDIR:/=_%"
+
+REM Remote workdir -> ONE directory-name-safe token.
+REM   /home/x/proj        -> home_x_proj
+REM   C:/Users/x/proj     -> C_Users_x_proj
+REM   C:\Users\x\my proj  -> C_Users_x_my_proj
+REM Rules: backslashes become "/", a leading drive colon is dropped, common
+REM unsafe characters become "_", runs of "_" collapse to one, and leading /
+REM trailing "_" are removed. An empty result falls back to "root".
+set "DIR_SLUG=%REMOTE_WORKDIR%"
+set "DIR_SLUG=%DIR_SLUG:\=/%"
+if "%DIR_SLUG:~1,1%"==":" set "DIR_SLUG=%DIR_SLUG:~0,1%%DIR_SLUG:~2%"
+set "DIR_SLUG=%DIR_SLUG:/=_%"
+set "DIR_SLUG=%DIR_SLUG: =_%"
+set "DIR_SLUG=%DIR_SLUG::=_%"
+set "DIR_SLUG=%DIR_SLUG:@=_%"
+set "DIR_SLUG=%DIR_SLUG:+=_%"
+set "DIR_SLUG=%DIR_SLUG:&=_%"
+set "DIR_SLUG=%DIR_SLUG:(=_%"
+set "DIR_SLUG=%DIR_SLUG:)=_%"
+set "DIR_SLUG=%DIR_SLUG:[=_%"
+set "DIR_SLUG=%DIR_SLUG:]=_%"
+set "DIR_SLUG=%DIR_SLUG:{=_%"
+set "DIR_SLUG=%DIR_SLUG:}=_%"
+set "DIR_SLUG=%DIR_SLUG:;=_%"
+set "DIR_SLUG=%DIR_SLUG:,=_%"
+set "DIR_SLUG=%DIR_SLUG:!=_%"
+set "DIR_SLUG=%DIR_SLUG:'=_%"
+set "DIR_SLUG=%DIR_SLUG:`=_%"
+
+:slug_collapse
+if not defined DIR_SLUG goto slug_empty
+set "SLUG_TMP=%DIR_SLUG:__=_%"
+if "%SLUG_TMP%"=="%DIR_SLUG%" goto slug_trim_lead
+set "DIR_SLUG=%SLUG_TMP%"
+goto slug_collapse
+
+:slug_trim_lead
+if not defined DIR_SLUG goto slug_empty
+if not "%DIR_SLUG:~0,1%"=="_" goto slug_trim_tail
 set "DIR_SLUG=%DIR_SLUG:~1%"
-if not defined DIR_SLUG set "DIR_SLUG=root"
+goto slug_trim_lead
+
+:slug_trim_tail
+if not defined DIR_SLUG goto slug_empty
+if not "%DIR_SLUG:~-1%"=="_" goto have_slug
+set "DIR_SLUG=%DIR_SLUG:~0,-1%"
+goto slug_trim_tail
+
+:slug_empty
+set "DIR_SLUG=root"
 goto have_slug
 
 :no_workdir
@@ -114,13 +156,13 @@ set "SESSION_DIR=%USERPROFILE%\.opencode\remote-sessions\%HOST_ONLY%_%DIR_SLUG%"
 if not exist "%SESSION_DIR%" mkdir "%SESSION_DIR%"
 cd /d "%SESSION_DIR%"
 
-REM REMOTE_* are exported for compatibility only: they reach the plugin only
-REM under "opencode run --standalone". Undefined ones are simply left unset so
-REM that a placeholder cannot accidentally activate remote mode. (Variables set
-REM with "set" are already part of the child environment.)
+REM REMOTE_* are exported for compatibility only: the plugin reads no
+REM environment at all in 3.x, so they cannot activate remote mode. Undefined
+REM ones are simply left unset. (Variables set with "set" are already part of
+REM the child environment.)
 
-echo [remote-opencode] note: remote config lives in opencode.jsonc plugin options (see PORTING-NOTES.md).
-echo [remote-opencode] REMOTE_* exports only take effect with "opencode run --standalone".
+echo [remote-opencode] note: the remote is configured in opencode.jsonc plugin options (see AGENTS.md).
+echo [remote-opencode] session directory: %SESSION_DIR%
 
 opencode %OPENCODE_ARGS%
 endlocal

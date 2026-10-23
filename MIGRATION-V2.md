@@ -1,5 +1,12 @@
 # 移植契约：OpenCode V1 插件 API → V2 插件 API
 
+> **历史文档（仅描述 V1 → V2 的 API 契约，对应 2.x）**
+> 3.0.0 之后仓库已重构为跨平台版本（POSIX + Windows、`glob`/`grep` 走纯 SFTP、配置只走插件
+> `options`）。本文里的 `REMOTE_*` 环境变量、`pullAll`/`pushAll`、`src/tools/bash.ts`、
+> `src/test-e2e.ts` 等描述**已不适用于当前代码**：升级请看 [`MIGRATION-V3.md`](MIGRATION-V3.md)，
+> 当前行为见 [`AGENTS.md`](AGENTS.md)。文中 V2 的插件 API 契约（`Plugin.define({ id, setup })`、
+> `ctx.tool.transform`、`ctx.permission.assert`、`{ content, metadata }` 返回形态）依然成立。
+
 本文件由主 agent 实测得出，是移植的唯一依据。**不要凭记忆猜测 API**，有疑问就按本文或去查
 `node_modules/@opencode/plugin/dist/**/*.d.ts`。
 

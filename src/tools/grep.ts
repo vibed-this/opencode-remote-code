@@ -1,48 +1,53 @@
-import type { RemoteConfig } from "../config.js"
-import type { SSHPool } from "../ssh-pool.js"
-import type { RemoteToolDefinition, RemoteToolResult } from "../v2-bridge.js"
+/**
+ * `grep` over SFTP (DESIGN-V3 §7.3/§7.4).
+ *
+ * V2 ran `rg --json` with a `grep -Ern` fallback; V3 walks the tree with bounded
+ * SFTP `readdir`s, reads candidate files over SFTP and matches with the JS
+ * `RegExp` engine (`remote/search.ts`). No remote shell, and therefore identical
+ * semantics whether the remote is Linux, macOS or Windows.
+ *
+ * The rendered format is deliberately the one the model already knows from V2
+ * (header, `path:`, `  Line <n>: <text>`, blank line between files) so existing
+ * trajectories keep working:
+ *
+ *   Found 2 matches
+ *   /home/x/proj/src/a.ts:
+ *     Line 12: const x = 1
+ *     Line 40: const y = 2
+ *
+ *   /home/x/proj/src/b.ts:
+ *     Line 7: const z = 3
+ *
+ * Differences from the shell implementation that the model can observe:
+ *   - the regex dialect is JavaScript (not Rust/PCRE); leading `(?i)`/`(?m)`/`(?s)`
+ *     are lifted into `RegExp` flags, anything else illegal fails loudly;
+ *   - the byte budget (64 MiB), per-file size cap (2 MiB), match cap (100) and
+ *     wall-clock budget (20 s) can cut the search short, and the output then
+ *     says so instead of pretending the repo contains nothing.
+ */
+import { compileSearchPattern, searchFiles } from "../remote/search.js"
+import type { RemoteToolDefinition } from "../v2-bridge.js"
+import { resolveRemotePath, truncationNote, type RemoteToolContext } from "./context.js"
 
-interface RgMatch {
-  type: "match"
-  data: {
-    path: { text: string }
-    lines: { text: string }
-    line_number: number
-    absolute_offset: number
-    submatches: Array<{
-      match: { text: string }
-      start: number
-      end: number
-    }>
-  }
-}
+/** Matched line text is cut here so one minified file cannot flood the context. */
+const MAX_LINE_LENGTH = 2000
 
-interface RgSummary {
-  type: "summary"
-  data: {
-    stats: {
-      matches: number
-    }
-  }
-}
-
-type RgMessage = RgMatch | RgSummary | { type: string }
-
-export function createGrepTool(config: RemoteConfig, sshPool: SSHPool): RemoteToolDefinition {
+export function createGrepTool(ctx: RemoteToolContext): RemoteToolDefinition {
   return {
     name: "grep",
-    description: `Search file contents using grep/ripgrep on the remote machine.`,
+    description: `Search file contents on the remote machine.`,
     input: {
       type: "object",
       properties: {
         pattern: {
           type: "string",
-          description: "The regex pattern to search for in file contents",
+          description:
+            "The regular expression (JavaScript syntax) to search for in file contents",
         },
         path: {
           type: "string",
           description:
-            "The directory to search in. Defaults to the current working directory.",
+            "The directory to search in (absolute path on the remote machine). Defaults to the workspace root.",
         },
         include: {
           type: "string",
@@ -52,129 +57,103 @@ export function createGrepTool(config: RemoteConfig, sshPool: SSHPool): RemoteTo
       required: ["pattern"],
       additionalProperties: false,
     },
-    async execute(args, _ctx) {
-      const searchDir = args.path || config.remoteWorkdir
-      const limit = 100
 
-      // Try ripgrep with JSON output and reverse-time sorting first
-      let cmd: string
-      const escapedPattern = args.pattern.replace(/'/g, "'\"'\"'")
-      if (args.include) {
-        const glob = args.include.replace(/'/g, "'\"'\"'")
-        cmd = `cd ${quoteShell(searchDir)} && rg --json --sortr=modified --glob '${glob}' -n -- '${escapedPattern}' 2>/dev/null`
-      } else {
-        cmd = `cd ${quoteShell(searchDir)} && rg --json --sortr=modified -n -- '${escapedPattern}' 2>/dev/null`
+    async execute(args, _call) {
+      const pattern = typeof args.pattern === "string" ? args.pattern : ""
+      if (pattern.trim() === "") {
+        throw new Error('Remote Code: grep requires a non-empty "pattern" string')
       }
 
-      let result = await sshPool.exec(cmd, { timeout: 30_000 })
+      // Fail before any I/O, and put the pattern at the front of the message:
+      // the model wrote it, so it is the thing it can actually fix (§7.4).
+      try {
+        compileSearchPattern(pattern)
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err)
+        throw new Error(`Pattern ${JSON.stringify(pattern)}: ${detail}`)
+      }
 
-      // Fallback to grep if rg not available or produced no output
-      if (!result.stdout.trim()) {
-        if (args.include) {
-          const glob = args.include.replace(/'/g, "'\"'\"'")
-          cmd = `cd ${quoteShell(searchDir)} && grep -Ern --include='${glob}' -- '${escapedPattern}' . 2>/dev/null`
+      const searchDir = args.path ? resolveRemotePath(ctx, args.path) : ctx.remoteRoot
+      const include = typeof args.include === "string" && args.include.trim() !== ""
+        ? args.include
+        : undefined
+
+      const result = await searchFiles(ctx.fs, ctx.ops, {
+        root: searchDir,
+        pattern,
+        include,
+        ignore: ctx.ignore,
+        maxMatches: ctx.limits.searchMatches,
+        maxBytes: ctx.limits.searchBytes,
+        maxFileSize: ctx.limits.searchFileSize,
+        maxMillis: ctx.limits.searchMillis,
+        walkLimits: {
+          maxDepth: ctx.limits.walkDepth,
+          maxEntries: ctx.limits.walkEntries,
+        },
+      })
+
+      const { matches, truncated, reason } = result
+      // "the match cap stopped us" is distinguishable from every other budget:
+      // it is the only one where the match list itself is full.
+      const capped = truncated && reason === "matches"
+
+      const lines: string[] = []
+      if (matches.length === 0) {
+        if (!truncated) {
+          lines.push("No files found")
         } else {
-          cmd = `cd ${quoteShell(searchDir)} && grep -Ern -- '${escapedPattern}' . 2>/dev/null`
+          lines.push(truncationNote(reason, budgetDetail(result)))
         }
-        result = await sshPool.exec(cmd, { timeout: 30_000 })
-        return parseGrepOutput(result.stdout, searchDir, args.pattern, limit)
+      } else {
+        lines.push(`Found ${matches.length} matches${capped ? ` (showing first ${matches.length})` : ""}`)
+
+        let currentPath = ""
+        for (const match of matches) {
+          if (match.path !== currentPath) {
+            if (currentPath !== "") lines.push("")
+            currentPath = match.path
+            lines.push(`${match.path}:`)
+          }
+          const text =
+            match.text.length > MAX_LINE_LENGTH
+              ? `${match.text.substring(0, MAX_LINE_LENGTH)}...`
+              : match.text
+          lines.push(`  Line ${match.line}: ${text}`)
+        }
+
+        if (truncated) {
+          lines.push("")
+          lines.push(truncationNote(reason, budgetDetail(result)))
+        }
       }
 
-      return parseRgJsonOutput(result.stdout, searchDir, args.pattern, limit)
+      return {
+        content: lines.join("\n"),
+        metadata: {
+          title: pattern,
+          matches: matches.length,
+          truncated,
+        },
+      }
     },
   }
 }
 
-function parseRgJsonOutput(stdout: string, searchDir: string, pattern: string, limit: number) {
-  const lines = stdout.split("\n").filter(Boolean)
-  const matches: Array<{ path: string; line: number; text: string }> = []
-
-  for (const line of lines) {
-    try {
-      const msg = JSON.parse(line) as RgMessage
-      if (msg.type === "match") {
-        const m = msg as RgMatch
-        const rawPath = m.data.path.text
-        const fullPath = rawPath.startsWith("/") ? rawPath : searchDir + "/" + rawPath
-        matches.push({
-          path: fullPath,
-          line: m.data.line_number,
-          text: m.data.lines.text,
-        })
-      }
-    } catch {
-      // ignore malformed JSON lines
-    }
+/**
+ * The `detail` half of `truncationNote()`. The match case wants a bare number
+ * ("showing the first 100 matches"); every other budget reads better with the
+ * amount of work that was actually done.
+ */
+function budgetDetail(result: {
+  reason?: string
+  matches: { length: number }
+  scannedFiles: number
+  scannedBytes: number
+}): string {
+  if (result.reason === "matches") return String(result.matches.length)
+  if (result.reason === "bytes") {
+    return `${result.scannedFiles} files scanned, ${Math.round(result.scannedBytes / (1024 * 1024))} MiB read`
   }
-
-  return formatGrepResult(matches, pattern, limit)
+  return `${result.scannedFiles} files scanned`
 }
-
-function parseGrepOutput(stdout: string, searchDir: string, pattern: string, limit: number) {
-  const lines = stdout.split("\n").filter(Boolean)
-  const matches: Array<{ path: string; line: number; text: string }> = []
-
-  for (const line of lines) {
-    const firstColon = line.indexOf(":")
-    if (firstColon === -1) continue
-    const secondColon = line.indexOf(":", firstColon + 1)
-    if (secondColon === -1) continue
-
-    let rawPath = line.slice(0, firstColon)
-    const lineNum = parseInt(line.slice(firstColon + 1, secondColon), 10)
-    const text = line.slice(secondColon + 1)
-
-    if (isNaN(lineNum)) continue
-    if (rawPath.startsWith("./")) rawPath = rawPath.slice(2)
-    const fullPath = rawPath.startsWith("/") ? rawPath : searchDir + "/" + rawPath
-
-    matches.push({ path: fullPath, line: lineNum, text })
-  }
-
-  return formatGrepResult(matches, pattern, limit)
-}
-
-function formatGrepResult(
-  matches: Array<{ path: string; line: number; text: string }>,
-  pattern: string,
-  limit: number
-): RemoteToolResult {
-  if (matches.length === 0) {
-    return {
-      content: "No files found",
-      metadata: { title: pattern, matches: 0, truncated: false },
-    }
-  }
-
-  const total = matches.length
-  const truncated = total > limit
-  const display = truncated ? matches.slice(0, limit) : matches
-
-  const output: string[] = []
-  output.push(`Found ${total} matches${truncated ? ` (showing first ${limit})` : ""}`)
-
-  let current = ""
-  for (const m of display) {
-    if (current !== m.path) {
-      if (current !== "") output.push("")
-      current = m.path
-      output.push(`${m.path}:`)
-    }
-    const text = m.text.length > 2000 ? m.text.substring(0, 2000) + "..." : m.text
-    output.push(`  Line ${m.line}: ${text}`)
-  }
-
-  if (truncated) {
-    output.push("")
-    output.push(
-      `(Results truncated: showing ${limit} of ${total} matches (${total - limit} hidden). Consider using a more specific pattern.)`
-    )
-  }
-
-  return {
-    content: output.join("\n"),
-    metadata: { title: pattern, matches: total, truncated },
-  }
-}
-
-import { quoteShell } from "../shell-quote.js"

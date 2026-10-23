@@ -1,16 +1,28 @@
-import fs from "fs/promises"
-import path from "path"
-import type { RemoteConfig } from "../config.js"
-import type { PathMapper } from "../path-mapper.js"
-import type { SyncEngine } from "../sync-engine.js"
-import type { SSHPool } from "../ssh-pool.js"
-import { readFileWithBom, joinBom } from "../bom.js"
-import { quoteShell } from "../shell-quote.js"
-import type {
-  PermissionGateway,
-  RemoteToolDefinition,
-  ToolCallIdentity,
-} from "../v2-bridge.js"
+/**
+ * `patch` — apply a native OpenCode patch (`*** Begin Patch …`) or a unified
+ * diff to remote files through the local mirror.
+ *
+ * V3 plumbing (DESIGN-V3 §7.3 / §8.3):
+ *  - remote paths go through `resolveRemotePath()` (nothing here knows about
+ *    POSIX path syntax);
+ *  - each involved file is pulled/pushed on its own (`ensureLocal` / `commit`)
+ *    instead of a full-mirror transfer in both directions;
+ *  - "move to" is `SyncEngine.rename()` (remote rename + local rename +
+ *    manifest update over SFTP) instead of a remote shell `rm` plus a
+ *    reach-through into the engine's manifest.
+ *
+ * Line endings: the incoming `patchText` is normalised to LF for parsing, each
+ * target file's own ending is detected from its current content, hunks are
+ * applied to the LF form and the result is re-encoded with that ending. Files
+ * created by a patch get `"\n"`.
+ */
+import fs from "node:fs/promises"
+import path from "node:path"
+
+import { readFileWithBom, joinBom, splitBom } from "../bom.js"
+import type { RemoteToolDefinition, ToolCallIdentity } from "../v2-bridge.js"
+import { resolveRemotePath, type RemoteToolContext } from "./context.js"
+import { applyLineEnding, detectLineEnding, normalizeToLf } from "./text.js"
 
 // ========================================================================
 // Copied from OpenCode packages/opencode/src/patch/index.ts
@@ -493,7 +505,11 @@ function findHunkPosition(lines: string[], hunk: HunkUnified): number {
   }
 
   if (oldLines.length === 0) {
-    return expectedIndex >= 0 && expectedIndex <= lines.length ? expectedIndex : -1
+    // Pure insertion. `@@ -0,0 +1,N @@` (the "new file" form git emits for a
+    // `--- /dev/null` hunk) has oldStart 0, so `oldStart - 1` would be -1 and the
+    // hunk would be rejected; it means "insert at the beginning".
+    const insertAt = hunk.oldStart <= 0 ? 0 : expectedIndex
+    return insertAt >= 0 && insertAt <= lines.length ? insertAt : -1
   }
 
   const exact = tryMatchUnified(lines, expectedIndex, oldLines)
@@ -521,13 +537,17 @@ function tryMatchUnified(lines: string[], idx: number, oldLines: string[]): numb
 // Tool definition
 // ========================================================================
 
-export function createPatchTool(
-  config: RemoteConfig,
-  pathMapper: PathMapper,
-  syncEngine: SyncEngine,
-  sshPool: SSHPool,
-  permission: PermissionGateway
-): RemoteToolDefinition {
+/** One file operation prepared from the patch, ready to run per file. */
+interface PatchFile {
+  /** Destination remote path (canonical). */
+  path: string
+  /** Receives the target file's current content as LF, returns the new content as LF. */
+  apply: (content: string) => string
+  /** Source remote path for a "*** Move to:" update. */
+  moveFrom?: string
+}
+
+export function createPatchTool(ctx: RemoteToolContext): RemoteToolDefinition {
   return {
     name: "patch",
     description: `Apply a patch to files on the remote machine.`,
@@ -542,21 +562,22 @@ export function createPatchTool(
       required: ["patchText"],
       additionalProperties: false,
     },
-    async execute(args, ctx) {
+    async execute(args, identity) {
       if (!args.patchText.trim()) {
         throw new Error("patchText is required")
       }
 
-      const patchText = args.patchText.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+      // Parsing always happens on LF text (CRLF patches are common on Windows).
+      const patchText = normalizeToLf(args.patchText)
 
-      let files: Array<{ path: string; apply: (content: string) => string; moveFrom?: string }>
+      let files: PatchFile[]
       if (patchText.includes("*** Begin Patch")) {
-        files = await parseAndPrepareNative(patchText, config, pathMapper, permission, ctx)
+        files = await parseAndPrepareNative(patchText, ctx, identity)
         if (files.length === 0) {
-          files = await parseAndPrepareUnified(patchText, config, pathMapper, permission, ctx)
+          files = await parseAndPrepareUnified(patchText, ctx, identity)
         }
       } else {
-        files = await parseAndPrepareUnified(patchText, config, pathMapper, permission, ctx)
+        files = await parseAndPrepareUnified(patchText, ctx, identity)
       }
 
       if (files.length === 0) {
@@ -565,41 +586,34 @@ export function createPatchTool(
 
       const involvedPaths = new Set<string>()
       for (const f of files) {
-        involvedPaths.add(f.path)
         if (f.moveFrom) involvedPaths.add(f.moveFrom)
+        involvedPaths.add(f.path)
       }
 
-      for (const rp of involvedPaths) {
-        await syncEngine.register(rp)
-      }
-      await syncEngine.pullAll()
-
+      // One file at a time: pull just this file, patch it, push just this file.
       for (const f of files) {
-        // For moves, read from the source path; otherwise read from the target path
-        const sourcePath = f.moveFrom ?? f.path
-        const localSourcePath = pathMapper.toLocal(sourcePath)
-        const { bom, text } = await readFileWithBom(fs, localSourcePath)
-        const newText = f.apply(text)
-        const localDestPath = pathMapper.toLocal(f.path)
-        await fs.mkdir(path.dirname(localDestPath), { recursive: true })
-        await fs.writeFile(localDestPath, joinBom(newText, bom), "utf-8")
-      }
+        const sourceRemote = f.moveFrom ?? f.path
+        const sourceLocal = await ctx.sync.ensureLocal(sourceRemote)
 
-      await syncEngine.pushAll()
+        // A missing remote file is mirrored as an empty local file (add-file
+        // path); "" therefore means "new file" and defaults to LF.
+        const existing = await readFileWithBom(fs, sourceLocal).catch(() => ({ bom: false, text: "" }))
+        const ending = detectLineEnding(existing.text)
+        const patchedLf = f.apply(normalizeToLf(existing.text))
+        const encoded = applyLineEnding(patchedLf, ending)
+        const bom = existing.bom || splitBom(patchedLf).bom
 
-      // Handle file moves: remote mv + local rename + manifest cleanup
-      for (const f of files) {
+        const destLocal = ctx.mapper.toLocal(f.path)
+        await fs.mkdir(path.dirname(destLocal), { recursive: true })
+
+        // Rename before writing: `rename()` moves the *existing* mirror file, so
+        // writing first would have it overwritten by the pre-patch content.
         if (f.moveFrom) {
-          const fromLocal = pathMapper.toLocal(f.moveFrom)
-          const toLocal = pathMapper.toLocal(f.path)
-          // Remove remote source, then rename local mirror
-          await sshPool.exec(
-            `rm -f ${quoteShell(f.moveFrom)}`,
-            { timeout: 10_000 }
-          )
-          await fs.rename(fromLocal, toLocal).catch(() => {})
-          ;(syncEngine as any).manifest.remove(f.moveFrom)
+          await ctx.sync.rename(f.moveFrom, f.path)
         }
+
+        await fs.writeFile(destLocal, joinBom(encoded, bom), "utf-8")
+        await ctx.sync.commit(f.path)
       }
 
       return {
@@ -615,20 +629,19 @@ export function createPatchTool(
 
 async function parseAndPrepareUnified(
   patchText: string,
-  config: RemoteConfig,
-  pathMapper: PathMapper,
-  permission: PermissionGateway,
+  ctx: RemoteToolContext,
   identity: ToolCallIdentity
-): Promise<Array<{ path: string; apply: (content: string) => string }>> {
+): Promise<PatchFile[]> {
   const parsed = parseUnifiedPatch(patchText)
-  const result: Array<{ path: string; apply: (content: string) => string }> = []
+  const result: PatchFile[] = []
 
   for (const file of parsed) {
     const targetPath = file.newPath ?? file.oldPath
     if (!targetPath) continue
-    const rp = normalizePatchPath(targetPath, config.remoteWorkdir)
-    if (!pathMapper.isWithinWorkspace(rp)) {
-      await permission(identity, {
+    const rp = normalizePatchPath(ctx, targetPath)
+    if (!rp) continue
+    if (!ctx.mapper.isWithinWorkspace(rp)) {
+      await ctx.permission(identity, {
         action: "edit",
         resources: [rp],
         save: [rp],
@@ -647,18 +660,17 @@ async function parseAndPrepareUnified(
 
 async function parseAndPrepareNative(
   patchText: string,
-  config: RemoteConfig,
-  pathMapper: PathMapper,
-  permission: PermissionGateway,
+  ctx: RemoteToolContext,
   identity: ToolCallIdentity
-): Promise<Array<{ path: string; apply: (content: string) => string; moveFrom?: string }>> {
+): Promise<PatchFile[]> {
   const hunks = parsePatch(patchText).hunks
-  const result: Array<{ path: string; apply: (content: string) => string; moveFrom?: string }> = []
+  const result: PatchFile[] = []
 
   for (const hunk of hunks) {
-    const rp = normalizePatchPath(hunk.path, config.remoteWorkdir)
-    if (!pathMapper.isWithinWorkspace(rp)) {
-      await permission(identity, {
+    const rp = normalizePatchPath(ctx, hunk.path)
+    if (!rp) continue
+    if (!ctx.mapper.isWithinWorkspace(rp)) {
+      await ctx.permission(identity, {
         action: "edit",
         resources: [rp],
         save: [rp],
@@ -678,9 +690,7 @@ async function parseAndPrepareNative(
       })
     } else if (hunk.type === "update" && hunk.chunks) {
       const chunks = hunk.chunks
-      const movePath = hunk.move_path
-        ? normalizePatchPath(hunk.move_path, config.remoteWorkdir)
-        : undefined
+      const movePath = hunk.move_path ? normalizePatchPath(ctx, hunk.move_path) : null
       if (movePath) {
         result.push({
           path: movePath,
@@ -699,16 +709,23 @@ async function parseAndPrepareNative(
   return result
 }
 
-function normalizePatchPath(raw: string, remoteWorkdir: string): string {
+/**
+ * Patch header path → canonical remote path.
+ *
+ * Strips the `a/`/`b/` prefixes and any `\t<timestamp>` suffix of git-style
+ * unified diffs, then lets `resolveRemotePath()` resolve relative paths against
+ * the workspace root (the model routinely writes `src/main.ts`). Returns `null`
+ * for `/dev/null` and empty headers, which denote "no such side" rather than a
+ * file.
+ */
+function normalizePatchPath(ctx: RemoteToolContext, raw: string): string | null {
   let p = raw.trim()
-  if (p === "/dev/null") return p
+  if (p === "" || p === "/dev/null") return null
   if (p.startsWith("a/") || p.startsWith("b/")) {
     p = p.slice(2)
   }
   const tabIdx = p.indexOf("\t")
   if (tabIdx >= 0) p = p.slice(0, tabIdx)
-  if (!p.startsWith("/")) {
-    p = path.posix.join(remoteWorkdir, p)
-  }
-  return path.posix.normalize(p)
+  if (p.trim() === "" || p.trim() === "/dev/null") return null
+  return resolveRemotePath(ctx, p.trim())
 }

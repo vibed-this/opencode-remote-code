@@ -1,67 +1,44 @@
-import fs from "fs/promises"
-import path from "path"
-import type { PathMapper } from "../path-mapper.js"
-import type { SSHPool } from "../ssh-pool.js"
-import type { SyncEngine } from "../sync-engine.js"
-import type { PermissionGateway, RemoteToolDefinition } from "../v2-bridge.js"
+/**
+ * `read` over SFTP (DESIGN-V3 §7.3).
+ *
+ * V2 detected the remote type with a shell `test`/`ls -1pA` triple and sniffed
+ * binaries with `file`, `dd` and `od` — all POSIX-only. V3 asks SFTP instead:
+ *
+ *   ctx.fs.stat(p)                -> missing / directory / file
+ *   ctx.fs.readdir(p)             -> directory listing (`ls -1pA` replacement)
+ *   ctx.fs.readdir(parent)        -> "did you mean" suggestions for a typo
+ *   ctx.fs.readPrefix(p, 8 KiB)   -> NUL byte sniff (binary detection)
+ *   ctx.sync.ensureLocal(p)       -> pull one file into the local mirror
+ *   fs.readFile(localPath)        -> the bytes actually rendered
+ *
+ * The file itself is still read from the LOCAL mirror, not from the SFTP buffer:
+ * that is what keeps `read`/`write`/`edit`/`patch` looking at the same bytes, and
+ * it is the behaviour the existing BOM/e2e tests pin down (`ignoreBOM: true`
+ * keeps a UTF-8 BOM as a printable character instead of silently dropping it).
+ */
+import fs from "node:fs/promises"
 
+import { isBinaryExtension } from "../remote/search.js"
+import type { RemoteToolDefinition } from "../v2-bridge.js"
+import { resolveRemotePath, type RemoteToolContext } from "./context.js"
 
 const DEFAULT_LIMIT = 2000
 const MAX_BYTES = 50 * 1024
 const MAX_LINE_LENGTH = 2000
+/** Bytes inspected for NUL when sniffing for binary content (§7.3). */
+const SNIFF_BYTES = 8 * 1024
+const MAX_SUGGESTIONS = 3
 
-const BINARY_EXTENSIONS = new Set([
-  ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-  ".exe", ".dll", ".so", ".dylib", ".bin",
-  ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".svg",
-  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-  ".pyc", ".pyo", ".class", ".o", ".a", ".obj",
-  ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav",
-  ".ttf", ".otf", ".woff", ".woff2", ".eot",
-])
-
-function isBinaryByExtension(filePath: string): boolean {
-  const ext = path.extname(filePath).toLowerCase()
-  return BINARY_EXTENSIONS.has(ext)
+/** How the file was refused, e.g. "binary extension (.png)". */
+function binaryReason(fileName: string): string | null {
+  if (isBinaryExtension(fileName)) {
+    const dot = fileName.lastIndexOf(".")
+    return dot <= 0 ? "binary extension" : `binary extension (${fileName.slice(dot)})`
+  }
+  return null
 }
 
-async function checkRemoteBinary(
-  sshPool: SSHPool,
-  remotePath: string
-): Promise<{ isBinary: boolean; reason?: string }> {
-  // 1. Extension blacklist
-  if (isBinaryByExtension(remotePath)) {
-    return { isBinary: true, reason: "binary extension" }
-  }
-
-  // 2. Remote file command check
-  const fileResult = await sshPool.exec(
-    `file -b ${quoteShell(remotePath)} 2>/dev/null || echo "UNKNOWN"`,
-    { timeout: 10_000 }
-  )
-  const fileDesc = fileResult.stdout.trim().toLowerCase()
-  if (fileDesc !== "unknown" && !fileDesc.includes("text") && !fileDesc.includes("empty")) {
-    return { isBinary: true, reason: `file type: ${fileResult.stdout.trim()}` }
-  }
-
-  // 3. Remote null-byte check in first 4KB (fallback when file cmd unavailable or ambiguous)
-  const nullCheck = await sshPool.exec(
-    `dd bs=4096 count=1 if=${quoteShell(remotePath)} 2>/dev/null | od -An -tx1 | grep -q ' 00 ' && echo HAS_NULL || echo NO_NULL`,
-    { timeout: 10_000 }
-  )
-  if (nullCheck.stdout.trim() === "HAS_NULL") {
-    return { isBinary: true, reason: "null bytes detected" }
-  }
-
-  return { isBinary: false }
-}
-
-export function createReadTool(
-  pathMapper: PathMapper,
-  syncEngine: SyncEngine,
-  sshPool: SSHPool,
-  permission: PermissionGateway
-): RemoteToolDefinition {
+export function createReadTool(ctx: RemoteToolContext): RemoteToolDefinition {
   return {
     name: "read",
     description: `Read the contents of a file or list a directory on the remote machine.`,
@@ -84,99 +61,81 @@ export function createReadTool(
       required: ["filePath"],
       additionalProperties: false,
     },
-    async execute(args, ctx) {
-      let remotePath = path.posix.normalize(args.filePath)
-      if (!path.posix.isAbsolute(remotePath)) {
-        remotePath = path.posix.join(pathMapper.remoteRoot, remotePath)
-      }
-      if (!pathMapper.isWithinWorkspace(remotePath)) {
-        await permission(ctx, {
+
+    async execute(args, call) {
+      const p = resolveRemotePath(ctx, args.filePath)
+
+      // Reading outside the workspace is allowed but asked for (§Permissions).
+      if (!ctx.mapper.isWithinWorkspace(p)) {
+        await ctx.permission(call, {
           action: "read",
-          resources: [remotePath],
-          save: [remotePath],
+          resources: [p],
+          save: [p],
           metadata: {},
         })
       }
 
-      const localPath = pathMapper.toLocal(remotePath)
-      const limit = args.limit ?? DEFAULT_LIMIT
-      const offset = (args.offset ?? 1) - 1
+      const limit = countOr(args.limit, DEFAULT_LIMIT, 1)
+      // 1-indexed on the way in, 0-indexed internally; a negative/NaN offset is
+      // clamped rather than indexing past the start of the array.
+      const offset = countOr(args.offset, 1, 1) - 1
 
-      // Determine remote type (file / directory / missing)
-      const typeResult = await sshPool.exec(
-        `if [ -d ${quoteShell(remotePath)} ]; then echo "DIR"; elif [ -f ${quoteShell(remotePath)} ]; then echo "FILE"; else echo "MISSING"; fi`,
-        { timeout: 10_000 }
-      )
-      const remoteType = typeResult.stdout.trim()
+      // ---- type detection: SFTP only -------------------------------------
+      const stat = await ctx.fs.stat(p)
 
-      if (remoteType === "DIR") {
-        const result = await sshPool.exec(
-          `ls -1pA ${quoteShell(remotePath)}`,
-          { timeout: 15_000 }
-        )
-        const items = result.stdout
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean)
-        items.sort((a, b) => a.localeCompare(b))
-        const start = offset
-        const sliced = items.slice(start, start + limit)
-        const truncated = start + sliced.length < items.length
+      if (stat === null) return await missingPath(ctx, p)
+
+      if (stat.dir) {
+        const entries = await ctx.fs.readdir(p)
+        // `ls -1pA` suffixes: `/` for a directory, `@` for a symlink. A listing
+        // attribute is lstat-like, so a symlink shows up as `@` even when it
+        // points at a directory.
+        const names = entries
+          .map((entry) => (entry.dir ? `${entry.name}/` : entry.symlink ? `${entry.name}@` : entry.name))
+          .sort((a, b) => a.localeCompare(b))
+
+        const sliced = names.slice(offset, offset + limit)
+        const truncated = offset + sliced.length < names.length
 
         return {
           content: [
-            `<path>${remotePath}</path>`,
+            `<path>${p}</path>`,
             `<type>directory</type>`,
             `<entries>`,
             sliced.join("\n"),
             truncated
-              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length + 1})`
-              : `\n(${items.length} entries)`,
+              ? `\n(Showing ${sliced.length} of ${names.length} entries. Use 'offset' parameter to read beyond entry ${offset + sliced.length + 1})`
+              : `\n(${names.length} entries)`,
             `</entries>`,
           ].join("\n"),
           metadata: {
-            title: remotePath,
+            title: p,
             preview: sliced.slice(0, 20).join("\n"),
             truncated,
           },
         }
       }
 
-      if (remoteType === "MISSING") {
-        // Suggest similar files from remote parent directory
-        const remoteDir = path.posix.dirname(remotePath)
-        const base = path.posix.basename(remotePath).toLowerCase()
-        let suggestions: string[] = []
-        try {
-          const result = await sshPool.exec(`ls -1A ${quoteShell(remoteDir)}`, { timeout: 10_000 })
-          const items = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
-          suggestions = items
-            .filter((i) => i.toLowerCase().includes(base) || base.includes(i.toLowerCase()))
-            .slice(0, 3)
-        } catch {}
-        if (suggestions.length > 0) {
-          throw new Error(
-            `File not found: ${remotePath}\n\nDid you mean one of these?\n${suggestions.join("\n")}`
-          )
-        }
-        throw new Error(`File not found: ${remotePath}`)
-      }
-
-      // For files: check binary on remote BEFORE syncing
-      const binaryCheck = await checkRemoteBinary(sshPool, remotePath)
-      if (binaryCheck.isBinary) {
+      // ---- binary gate (before the file is pulled over the wire) ---------
+      const reason = binaryReason(p)
+      if (reason !== null) {
         throw new Error(
-          `Cannot read binary file: ${remotePath}\n\nReason: ${binaryCheck.reason}. Use bash tools to inspect it if needed.`
+          `Cannot read binary file: ${p}\n\nReason: ${reason}. Use the shell tool to inspect it if needed.`
         )
       }
 
-      // Safe to sync: it's a text file
-      await syncEngine.register(remotePath)
-      await syncEngine.pullAll()
+      const prefix = await ctx.fs.readPrefix(p, SNIFF_BYTES)
+      if (prefix.includes(0)) {
+        throw new Error(
+          `Cannot read binary file: ${p}\n\nReason: NUL byte in the first ${SNIFF_BYTES} bytes. Use the shell tool to inspect it if needed.`
+        )
+      }
 
+      // ---- text: pull the single file into the mirror, read it locally ---
+      const localPath = await ctx.sync.ensureLocal(p)
       const buf = await fs.readFile(localPath)
       // ignoreBOM: true preserves the BOM as a regular character in the output
-      // (false would consume/remove it, which is what readFileWithBom does for editing)
+      // (false consumes it, which is what the editing tools do instead).
       const content = new TextDecoder("utf-8", { ignoreBOM: true }).decode(buf)
       const lines = content.split("\n")
 
@@ -196,10 +155,10 @@ export function createReadTool(
           more = true
           break
         }
-        let line = lines[i]
+        let line = lines[i] as string
         // Line length truncation
         if (line.length > MAX_LINE_LENGTH) {
-          line = line.substring(0, MAX_LINE_LENGTH) + " ... (line truncated)"
+          line = `${line.substring(0, MAX_LINE_LENGTH)} ... (line truncated)`
         }
         const size = Buffer.byteLength(line, "utf-8") + (out.length > 0 ? 1 : 0)
         if (bytes + size > MAX_BYTES) {
@@ -211,7 +170,7 @@ export function createReadTool(
         bytes += size
       }
 
-      let output = [`<path>${remotePath}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
+      let output = [`<path>${p}</path>`, `<type>file</type>`, "<content>\n"].join("\n")
       output += out.map((line, i) => `${i + start + 1}: ${line}`).join("\n")
       const last = start + out.length
       if (cut) {
@@ -226,7 +185,7 @@ export function createReadTool(
       return {
         content: output,
         metadata: {
-          title: remotePath,
+          title: p,
           preview: out.slice(0, 20).join("\n"),
           truncated: more || cut,
         },
@@ -235,7 +194,54 @@ export function createReadTool(
   }
 }
 
-function quoteShell(input: string): string {
-  if (/^[a-zA-Z0-9_.\/\-]+$/.test(input)) return input
-  return `"${input.replace(/"/g, '\\"')}"`
+/**
+ * Missing path: list the parent over SFTP and offer up to three near-misses.
+ * A model that typos `reacd.ts` recovers in one turn instead of two.
+ */
+async function missingPath(
+  ctx: RemoteToolContext,
+  p: string
+): Promise<never> {
+  const parent = ctx.ops.dirname(p)
+  const wanted = ctx.ops.basename(p).toLowerCase()
+
+  let suggestions: string[] = []
+  try {
+    const entries = await ctx.fs.readdir(parent)
+    // `ops.dirname(p) === p` at a filesystem root, where readdir is useless.
+    if (!ctx.ops.equals(parent, p) && wanted !== "") {
+      suggestions = entries
+        .map((entry) => entry.name)
+        .filter((name) => {
+          const lower = name.toLowerCase()
+          // Prefix or substring, in either direction: `main` finds `main.ts`
+          // and `index.tsx` is still offered for `index.ts`.
+          return lower.includes(wanted) || wanted.includes(lower)
+        })
+        .sort((a, b) => a.localeCompare(b))
+        .slice(0, MAX_SUGGESTIONS)
+    }
+  } catch {
+    // Unreadable/absent parent: no suggestions, but never a different error —
+    // the useful message is "this file does not exist".
+  }
+
+  if (suggestions.length > 0) {
+    throw new Error(
+      `File not found: ${p}\n\nDid you mean one of these?\n${suggestions.join("\n")}`
+    )
+  }
+  throw new Error(`File not found: ${p}`)
+}
+
+/**
+ * Coerce a model-supplied count. The JSON Schema says "number", but a schema is
+ * a hint, not a guarantee: `NaN`, `Infinity`, `-3` and `"10"` all arrive in
+ * practice, and any of them would either render garbage or throw a RangeError
+ * from `Array.prototype.slice`.
+ */
+function countOr(value: unknown, fallback: number, minimum: number): number {
+  const num = typeof value === "string" ? Number(value) : value
+  if (typeof num !== "number" || !Number.isFinite(num)) return fallback
+  return Math.max(minimum, Math.trunc(num))
 }

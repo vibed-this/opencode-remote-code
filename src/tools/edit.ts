@@ -1,11 +1,25 @@
-import fs from "fs/promises"
-import path from "path"
+/**
+ * `edit` — precise string replacement inside one remote file, via the local mirror.
+ *
+ * V3 plumbing (DESIGN-V3 §7.3 / §8.3): `resolveRemotePath()` for the path,
+ * `ctx.sync.ensureLocal()` for the single-file pull and `ctx.sync.commit()` for
+ * the single-file push (V2 transferred every tracked file in both directions).
+ * The line-ending helpers now live in `./text.js` and are shared with
+ * `write`/`patch`: the original content's ending is detected and the result is
+ * written back with it, so a CRLF file stays CRLF.
+ *
+ * The per-file lock is kept: it serialises concurrent `edit` calls on the same
+ * mirror file (the SyncEngine only serialises its own SFTP calls).
+ */
+import fs from "node:fs/promises"
+
 import { createTwoFilesPatch, diffLines } from "diff"
-import type { PathMapper } from "../path-mapper.js"
-import type { SyncEngine } from "../sync-engine.js"
+
 import { readFileWithBom, joinBom, splitBom } from "../bom.js"
 import { trimDiff } from "../diff-utils.js"
-import type { PermissionGateway, RemoteToolDefinition } from "../v2-bridge.js"
+import type { RemoteToolDefinition } from "../v2-bridge.js"
+import { resolveRemotePath, type RemoteToolContext } from "./context.js"
+import { applyLineEnding, detectLineEnding, normalizeToLf } from "./text.js"
 
 // ========================================================================
 // Per-file edit locks
@@ -29,20 +43,8 @@ async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<
 }
 
 // ========================================================================
-// Line ending helpers
+// Line ending helpers live in ./text.js (shared with write / patch)
 // ========================================================================
-function normalizeLineEndings(text: string): string {
-  return text.replaceAll("\r\n", "\n")
-}
-
-function detectLineEnding(text: string): "\n" | "\r\n" {
-  return text.includes("\r\n") ? "\r\n" : "\n"
-}
-
-function convertToLineEnding(text: string, ending: "\n" | "\r\n"): string {
-  if (ending === "\n") return text
-  return text.replaceAll("\n", "\r\n")
-}
 
 // ====================================================================
 // Local processing layer — ported from OpenCode 1.15.6 edit.ts
@@ -397,11 +399,7 @@ function countDiffStats(oldText: string, newText: string): { additions: number; 
 // Tool definition
 // ========================================================================
 
-export function createEditTool(
-  pathMapper: PathMapper,
-  syncEngine: SyncEngine,
-  permission: PermissionGateway
-): RemoteToolDefinition {
+export function createEditTool(ctx: RemoteToolContext): RemoteToolDefinition {
   return {
     name: "edit",
     description: `Make precise text replacements in a remote file.`,
@@ -425,17 +423,14 @@ export function createEditTool(
       required: ["filePath", "oldString", "newString"],
       additionalProperties: false,
     },
-    async execute(args, ctx) {
+    async execute(args, identity) {
       if (args.oldString === args.newString) {
         throw new Error("No changes to apply: oldString and newString are identical.")
       }
 
-      let remotePath = path.posix.normalize(args.filePath)
-      if (!path.posix.isAbsolute(remotePath)) {
-        remotePath = path.posix.join(pathMapper.remoteRoot, remotePath)
-      }
-      if (!pathMapper.isWithinWorkspace(remotePath)) {
-        await permission(ctx, {
+      const remotePath = resolveRemotePath(ctx, args.filePath)
+      if (!ctx.mapper.isWithinWorkspace(remotePath)) {
+        await ctx.permission(identity, {
           action: "edit",
           resources: [remotePath],
           save: [remotePath],
@@ -443,36 +438,48 @@ export function createEditTool(
         })
       }
 
-      const localPath = pathMapper.toLocal(remotePath)
+      // Lock key. `ensureLocal()` returns the same path (it maps through
+      // `PathMapper.toLocal`, including any long-path prefix).
+      const lockKey = ctx.mapper.toLocal(remotePath)
 
-      return withFileLock(localPath, async () => {
-        // Track, pull, edit, push
-        await syncEngine.register(remotePath)
-        await syncEngine.pullAll()
-
-        let content = ""
-        let bom = false
-        let existed = false
-        try {
-          const existing = await readFileWithBom(fs, localPath)
-          content = existing.text
-          bom = existing.bom
-          existed = true
-        } catch {}
-
+      return withFileLock(lockKey, async () => {
+        // `ensureLocal()` materialises an *empty* local file when the remote file
+        // is missing, so existence has to be asked of the remote side.
+        const stat = await ctx.fs.stat(remotePath)
+        if (stat && stat.dir) {
+          throw new Error(`Remote Code: ${remotePath} is a directory, not a file`)
+        }
+        const existed = stat !== null
         if (!existed && args.oldString !== "") {
           throw new Error(`File ${remotePath} not found`)
         }
 
+        const localPath = await ctx.sync.ensureLocal(remotePath)
+
+        let content = ""
+        let bom = false
+        if (existed) {
+          try {
+            const existing = await readFileWithBom(fs, localPath)
+            content = existing.text
+            bom = existing.bom
+          } catch {}
+        }
+
+        // Keep the file's own line ending (CRLF stays CRLF).
         const ending = detectLineEnding(content)
-        const oldNorm = convertToLineEnding(normalizeLineEndings(args.oldString), ending)
-        const newNorm = convertToLineEnding(normalizeLineEndings(args.newString), ending)
+        const oldNorm = applyLineEnding(args.oldString, ending)
+        const newNorm = applyLineEnding(args.newString, ending)
 
         const result = replaceContent(content, oldNorm, newNorm, args.replaceAll ?? false)
 
-        // Build diff preview for permission request
-        const diffPreview = generateDiffPreview(remotePath, content, result)
-        await permission(ctx, {
+        // Build diff preview for permission request (LF-normalised: never show \r)
+        const diffPreview = generateDiffPreview(
+          remotePath,
+          normalizeToLf(content),
+          normalizeToLf(result)
+        )
+        await ctx.permission(identity, {
           action: "edit",
           resources: [remotePath],
           save: [remotePath],
@@ -482,7 +489,9 @@ export function createEditTool(
         const next = splitBom(result)
         const desiredBom = bom || next.bom
         await fs.writeFile(localPath, joinBom(result, desiredBom), "utf-8")
-        await syncEngine.pushAll()
+
+        // Push just this file
+        await ctx.sync.commit(remotePath)
 
         const stats = countDiffStats(content, result)
 

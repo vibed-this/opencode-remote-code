@@ -1,7 +1,7 @@
 {
   "name": "opencode-remote-code",
-  "version": "0.2.1",
-  "description": "OpenCode plugin for remote machine control over SSH",
+  "version": "3.0.0",
+  "description": "OpenCode plugin that lets AI agents edit and run commands on a remote machine over SSH — Windows (OpenSSH + PowerShell) or POSIX — with zero footprint on the remote side",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -23,7 +23,8 @@
     "build": "tsc",
     "postbuild": "node scripts/postbuild.cjs",
     "dev": "tsc --watch",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node test/run-tests.mjs"
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.1.2"
@@ -52,6 +53,11 @@
     "plugin",
     "ssh",
     "remote",
-    "agent"
+    "agent",
+    "sftp",
+    "windows",
+    "openssh",
+    "powershell",
+    "posix"
   ]
 }

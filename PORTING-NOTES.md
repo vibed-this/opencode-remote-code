@@ -1,5 +1,12 @@
 # 移植笔记：OpenCode V1 插件 API → V2 插件 API
 
+> **历史文档（仅描述 V1 → V2 的移植过程，对应 2.x）**
+> 下面的文件清单、行号与"7 个工具原样保留 `rg`/`find`/`bash`"之类的结论是 2.x 的快照。
+> 3.0.0 之后 `src/tools/bash.ts` → `src/tools/shell.ts`，`glob`/`grep`/`read` 全部改为纯 SFTP，
+> `src/path-mapper.ts`/`manifest.ts`/`sync-engine.ts` 移到 `src/mirror/`，
+> `test-e2e.ts`/`test-extended.ts` 已删除，配置只走插件 `options`。升级请看
+> [`MIGRATION-V3.md`](MIGRATION-V3.md)，当前行为见 [`AGENTS.md`](AGENTS.md)。
+
 本文件记录 `opencode-remote-code` 从 V1（`@opencode-ai/plugin`，`(input, options) => Hooks`）到
 V2（`@opencode/plugin@2.1.2`，`Plugin.define({ id, setup })`）的移植结果。契约依据是仓库里的
 `MIGRATION-V2.md`。

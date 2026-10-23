@@ -3,13 +3,27 @@ import { readFileSync } from "fs"
 import type { RemoteConfig } from "./config.js"
 
 export interface SSHPool {
-  exec(command: string, options?: { cwd?: string; timeout?: number }): Promise<{
+  /**
+   * Run one command through the remote default shell.
+   *
+   * `command` is the *complete* command string produced by a `RemoteDialect`
+   * (`platform/dialect*.ts`) — this layer never prefixes `cd` or rewrites
+   * quoting, and `decode` is supplied by the dialect so Windows remotes can
+   * UTF-8/GB18030-negotiate the byte stream.
+   *
+   * `cwd` is deprecated (POSIX-only `cd … && …`); new callers pass the cwd to
+   * `dialect.buildCommand()` instead.
+   */
+  exec(
+    command: string,
+    options?: { cwd?: string; timeout?: number; decode?: (buf: Buffer) => string }
+  ): Promise<{
     stdout: string
     stderr: string
     exitCode: number
+    timedOut?: boolean
   }>
   withSftp<T>(fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T>
-  getSudoAskpassPath(): string | undefined
   close(): Promise<void>
 }
 
@@ -451,36 +465,21 @@ class ConnectionPool {
 }
 
 export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
-  const commandPoolSize = parseInt(process.env.REMOTE_POOL_COMMAND_SIZE || "3", 10)
-  const filePoolSize = parseInt(process.env.REMOTE_POOL_FILE_SIZE || "2", 10)
-  const staggerMs = parseInt(process.env.REMOTE_POOL_STAGGER_MS || "0", 10)
+  // Pool sizing is a plugin option now (DESIGN-V3 §9.2); the REMOTE_POOL_* env
+  // vars survive only as a fallback for the legacy test harnesses.
+  const commandPoolSize =
+    config.pool?.command ?? parseInt(process.env.REMOTE_POOL_COMMAND_SIZE || "3", 10)
+  const filePoolSize =
+    config.pool?.file ?? parseInt(process.env.REMOTE_POOL_FILE_SIZE || "2", 10)
+  const staggerMs =
+    config.pool?.stagger ?? parseInt(process.env.REMOTE_POOL_STAGGER_MS || "0", 10)
   const commandPool = new ConnectionPool(config, commandPoolSize, staggerMs)
   const filePool = new ConnectionPool(config, filePoolSize, staggerMs)
 
-  // Setup sudo askpass on remote if needed
-  let sudoAskpassPath: string | undefined
   try {
     await Promise.all([commandPool.ready, filePool.ready])
-
-    if (config.sudoPassword) {
-      const mktempResult = await execOnPool(
-        commandPool,
-        "mktemp /tmp/.opencode_sudo_askpass_XXXXXX"
-      )
-      sudoAskpassPath = mktempResult.stdout.trim()
-      const escaped = config.sudoPassword.replace(/'/g, "'\"'\"'")
-      await execOnPool(
-        commandPool,
-        `cat > ${quoteShell(sudoAskpassPath)} << 'EOF'\n#!/bin/sh\necho '${escaped}'\nEOF\nchmod 700 ${quoteShell(sudoAskpassPath)}`
-      )
-    }
   } catch (err) {
     // Startup failed: never leak the pools that did come up (sockets + timers).
-    if (sudoAskpassPath) {
-      await execOnPool(commandPool, `rm -f ${quoteShell(sudoAskpassPath)}`).catch(
-        () => {}
-      )
-    }
     await commandPool.close().catch(() => {})
     await filePool.close().catch(() => {})
     throw err
@@ -491,15 +490,10 @@ export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
     async exec(command, options = {}) {
       let shellCommand = command
       if (options.cwd) {
+        // Deprecated POSIX-only fallback: the dialects own cwd handling now.
         shellCommand = `cd ${quoteShell(options.cwd)} && ${command}`
       }
-      if (sudoAskpassPath && shellCommand.includes("sudo ")) {
-        shellCommand = `SUDO_ASKPASS=${quoteShell(sudoAskpassPath)} ${shellCommand.replace(
-          /\bsudo\b/g,
-          "sudo -A"
-        )}`
-      }
-      return execOnPool(commandPool, shellCommand, options.timeout)
+      return execOnPool(commandPool, shellCommand, options.timeout, options.decode)
     },
 
     async withSftp<T>(fn: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
@@ -527,18 +521,9 @@ export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
       }
     },
 
-    getSudoAskpassPath(): string | undefined {
-      return sudoAskpassPath
-    },
-
     async close() {
       if (closed) return
       closed = true
-      if (sudoAskpassPath) {
-        await execOnPool(commandPool, `rm -f ${quoteShell(sudoAskpassPath)}`).catch(
-          () => {}
-        )
-      }
       await Promise.all([commandPool.close(), filePool.close()])
     },
   }
@@ -547,14 +532,15 @@ export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
 async function execOnPool(
   pool: ConnectionPool,
   command: string,
-  timeoutMs?: number
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  timeoutMs?: number,
+  decode?: (buf: Buffer) => string
+): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut?: boolean }> {
   let lastError: Error | undefined
 
   for (let attempt = 0; attempt < 2; attempt++) {
     const client = await pool.acquire()
     try {
-      return await execOnClient(client, command, timeoutMs)
+      return await execOnClient(client, command, timeoutMs, decode)
     } catch (err) {
       lastError = err as Error
       const isConnError = isConnectionError(lastError)
@@ -582,53 +568,98 @@ async function execOnPool(
 async function execOnClient(
   client: Client,
   command: string,
-  timeoutMs?: number
-): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  timeoutMs?: number,
+  decode?: (buf: Buffer) => string
+): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut?: boolean }> {
   return new Promise((resolve, reject) => {
-    let stdout = ""
-    let stderr = ""
-    let killed = false
+    // Byte streams are accumulated as Buffers and decoded once, at the end, by
+    // the dialect: a Windows remote mixes UTF-8 (PowerShell) with CP936 (native
+    // tools), and a per-chunk toString() would corrupt both.
+    const outChunks: Buffer[] = []
+    const errChunks: Buffer[] = []
+    let settled = false
+    let streamRef: any
+
+    const finish = (result: {
+      stdout: string
+      stderr: string
+      exitCode: number
+      timedOut?: boolean
+    }) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(result)
+    }
 
     const timer =
       timeoutMs && timeoutMs > 0
         ? setTimeout(() => {
-            if (!killed) {
-              killed = true
-              reject(new Error(`Remote Code: SSH exec timeout after ${timeoutMs}ms`))
+            if (settled) return
+            // Close the channel so the remote process gets a chance to die, then
+            // report a timeout instead of rejecting: `shell` needs to tell a
+            // timeout apart from a transport failure.
+            try {
+              streamRef?.close()
+            } catch {
+              /* ignore */
             }
+            finish({
+              stdout: decodeChunks(decode, outChunks),
+              stderr: decodeChunks(decode, errChunks),
+              exitCode: 124,
+              timedOut: true,
+            })
           }, timeoutMs)
         : undefined
 
     client.exec(command, (err: Error | undefined, stream: any) => {
       if (err) {
         if (timer) clearTimeout(timer)
-        reject(err)
+        if (!settled) {
+          settled = true
+          reject(err)
+        }
         return
       }
+      streamRef = stream
 
-      stream
-        .on("data", (data: Buffer) => {
-          stdout += data.toString("utf-8")
+      // NOTE: `stderr` must be handled on its own line. Chaining
+      // `.stderr.on("data", …).on("close", …)` attaches the channel's `close`
+      // handler to *stderr* instead of the channel, so `close` never fires and
+      // every remote command reports exit code 0 — silently turning failures
+      // into successes.
+      stream.on("data", (data: Buffer) => {
+        outChunks.push(data)
+      })
+
+      stream.stderr.on("data", (data: Buffer) => {
+        errChunks.push(data)
+      })
+
+      stream.on("close", (code: number) => {
+        finish({
+          stdout: decodeChunks(decode, outChunks),
+          stderr: decodeChunks(decode, errChunks),
+          exitCode: code ?? 0,
         })
-        .stderr.on("data", (data: Buffer) => {
-          stderr += data.toString("utf-8")
-        })
-        .on("close", (code: number, signal: string) => {
-          if (timer) clearTimeout(timer)
-          if (killed) return
-          resolve({
-            stdout,
-            stderr,
-            exitCode: code ?? 0,
-          })
-        })
-        .on("error", (err: Error) => {
-          if (timer) clearTimeout(timer)
-          if (killed) return
-          reject(err)
-        })
+      })
+
+      stream.on("error", (err: Error) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        reject(err)
+      })
     })
   })
+}
+
+/** Join the received chunks and decode them with the dialect (default: UTF-8). */
+function decodeChunks(decode: ((buf: Buffer) => string) | undefined, chunks: Buffer[]): string {
+  if (chunks.length === 0) return ""
+  const joined = Buffer.concat(chunks)
+  return decode ? decode(joined) : joined.toString("utf-8")
 }
 
 function isConnectionError(err: Error): boolean {

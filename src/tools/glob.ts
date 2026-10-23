@@ -1,99 +1,111 @@
-import type { RemoteConfig } from "../config.js"
-import type { SSHPool } from "../ssh-pool.js"
+/**
+ * `glob` over SFTP (DESIGN-V3 §7.3).
+ *
+ * V2 shelled out to `rg --files --sortr=modified`, with a `find + stat + sort`
+ * fallback; neither exists on a Windows remote and the fallback could not
+ * express braces. V3 walks the tree with bounded SFTP `readdir` calls (`walk.ts`)
+ * and matches with the ripgrep-flavoured matcher in `remote/glob.ts`, so the same
+ * semantics apply to every remote. No remote shell is involved at all (§3.2).
+ *
+ * Two behaviours worth knowing when reading the output:
+ *
+ * - **Newest first.** Results are ordered by mtime descending (V2's
+ *   `--sortr=modified`), ties broken by path ascending so the output is stable.
+ *   A recursive listing is the tool's main use ("what changed recently"), and a
+ *   plain alphabetical listing buries it.
+ * - **"No files found" is only ever printed when the walk really finished.** If
+ *   the depth/entry/time budget cut the traversal short, or the result cap hid
+ *   files, the tool says so instead — a silent "nothing here" after a truncated
+ *   walk is the worst possible answer for a model.
+ */
+import { matchGlob } from "../remote/glob.js"
+import { walk, type WalkFile } from "../remote/walk.js"
 import type { RemoteToolDefinition } from "../v2-bridge.js"
+import { resolveRemotePath, truncationNote, type RemoteToolContext } from "./context.js"
 
-export function createGlobTool(config: RemoteConfig, sshPool: SSHPool): RemoteToolDefinition {
+export function createGlobTool(ctx: RemoteToolContext): RemoteToolDefinition {
   return {
     name: "glob",
     description: `Find files matching a glob pattern on the remote machine.`,
     input: {
       type: "object",
       properties: {
-        pattern: { type: "string", description: "The glob pattern to match files against" },
+        pattern: {
+          type: "string",
+          description: "The glob pattern to match files against",
+        },
         path: {
           type: "string",
-          description: "The directory to search in. Omit to use the default directory.",
+          description:
+            "The directory to search in (absolute path on the remote machine). Omit to search the workspace root.",
         },
       },
       required: ["pattern"],
       additionalProperties: false,
     },
-    async execute(args, _ctx) {
-      const searchDir = args.path || config.remoteWorkdir
-      const limit = 100
 
-      // Try ripgrep with reverse-time sorting first
-      const escapedPattern = args.pattern.replace(/'/g, "'\"'\"'")
-      const rgCmd = `cd ${quoteShell(searchDir)} && rg --files --sortr=modified --glob '${escapedPattern}' 2>/dev/null`
-      let result = await sshPool.exec(rgCmd, { timeout: 30_000 })
-
-      let lines: string[]
-
-      if (result.stdout.trim()) {
-        lines = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
-      } else {
-        // Fallback: find + stat for sorting
-        // find -name does NOT support brace expansion, so we expand manually.
-        const namePredicate = buildFindNamePredicate(args.pattern)
-        const findCmd = `cd ${quoteShell(searchDir)} && find . -maxdepth 10 ${namePredicate} -type f -exec stat -c '%Y %n' {} + 2>/dev/null | sort -rn | cut -d' ' -f2-`
-        result = await sshPool.exec(findCmd, { timeout: 30_000 })
-        lines = result.stdout.split("\n").map((l) => l.trim()).filter(Boolean)
+    async execute(args, _call) {
+      // The pattern is *only* ever a pattern — it is never fed to the path
+      // layer. So an absolute-looking pattern (`/src/*.ts`, `C:/x/*.ts`) is
+      // matched against the walk-relative path and simply finds nothing, which
+      // is exactly what V2's `rg --glob` did; the directory lives in `path`.
+      const pattern = typeof args.pattern === "string" ? args.pattern : ""
+      if (pattern.trim() === "") {
+        throw new Error('Remote Code: glob requires a non-empty "pattern" string')
       }
 
-      // Deduplicate and limit
-      const seen = new Set<string>()
-      const files: string[] = []
-      for (const line of lines) {
-        const full = line.startsWith("/") ? line : searchDir + "/" + line.replace(/^\.\//, "")
-        if (seen.has(full)) continue
-        seen.add(full)
-        files.push(full)
-        if (files.length >= limit + 1) break
-      }
+      // Resolved exactly once: every reported path is `join(searchDir, rel)`.
+      const searchDir = args.path ? resolveRemotePath(ctx, args.path) : ctx.remoteRoot
+      const limit = Math.max(1, ctx.limits.globResults)
 
-      const truncated = files.length > limit
-      if (truncated) files.length = limit
+      const walkResult = await walk(ctx.fs, ctx.ops, searchDir, {
+        ignore: ctx.ignore,
+        maxDepth: ctx.limits.walkDepth,
+        maxEntries: ctx.limits.walkEntries,
+        includeDirs: false,
+      })
 
-      const output: string[] = []
-      if (files.length === 0) output.push("No files found")
-      else {
-        output.push(...files)
-        if (truncated) {
-          output.push(``)
-          output.push(`(Results are truncated: showing first ${limit} results. Consider using a more specific path or pattern.)`)
-        }
+      // NTFS is case-insensitive, POSIX is not — `ops.kind` is the only place in
+      // the plugin that fact is allowed to surface (§3.3).
+      const caseInsensitive = ctx.ops.kind === "windows"
+      const matched = walkResult.files.filter((file: WalkFile) =>
+        matchGlob(pattern, file.rel, { caseInsensitive })
+      )
+
+      // Newest first, path ascending on ties (mtime granularity is 1 s over
+      // SFTP, so ties are common in a fresh checkout).
+      matched.sort((a, b) => {
+        if (b.dirent.mtime !== a.dirent.mtime) return b.dirent.mtime - a.dirent.mtime
+        return a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0
+      })
+
+      const shown = matched.slice(0, limit)
+      const capped = matched.length > limit
+      const truncated = capped || walkResult.truncated
+
+      const lines: string[] = shown.map((file) => ctx.ops.join(searchDir, file.rel))
+
+      if (truncated) {
+        // Only reached with an empty `lines` when the walk was cut short before
+        // finding anything at all — then the note *is* the whole answer.
+        if (lines.length > 0) lines.push("")
+        const reason = capped ? "results" : walkResult.reason
+        const detail = capped
+          ? `showing ${shown.length} of ${matched.length} files`
+          : `${walkResult.entries} entries visited`
+        lines.push(truncationNote(reason, detail))
+      } else if (lines.length === 0) {
+        lines.push("No files found")
       }
 
       return {
-        content: output.join("\n"),
+        content: lines.join("\n"),
         metadata: {
           title: searchDir,
-          count: files.length,
+          count: shown.length,
           truncated,
         },
       }
     },
   }
-}
-
-import { quoteShell } from "../shell-quote.js"
-
-/**
- * Convert a glob pattern into a `find` -name predicate.
- * Handles simple brace expansion: *.{ts,tsx} → \( -name '*.ts' -o -name '*.tsx' \)
- * Also strips leading double-star-slash because find is already recursive.
- */
-function buildFindNamePredicate(pattern: string): string {
-  // find traverses recursively by default, so **/ is redundant for -name
-  const normalized = pattern.startsWith("**/") ? pattern.slice(3) : pattern
-
-  const braceMatch = normalized.match(/^(.*)\{([^}]+)\}(.*)$/)
-  if (!braceMatch) {
-    return `-name ${quoteShell(normalized)}`
-  }
-  const prefix = braceMatch[1]
-  const options = braceMatch[2]
-  const suffix = braceMatch[3]
-  const parts = options.split(",").map((opt) => `-name ${quoteShell(prefix + opt + suffix)}`)
-  return `\\( ${parts.join(" -o ")} \\)`
 }
