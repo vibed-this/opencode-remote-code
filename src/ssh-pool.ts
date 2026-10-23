@@ -16,15 +16,33 @@ export interface SSHPool {
 const HEALTH_CHECK_INTERVAL_MS = 30_000
 const HEALTH_CHECK_TIMEOUT_MS = 5_000
 const RETRY_DELAY_MS = 500
+/** Base delay for replacement-connection retries: 5s, 10s, 20s, ... */
 const CONNECTION_RETRY_DELAY_MS = 5_000
+/** Hard cap on attempts per replenish() call. Never loop forever. */
+const REPLENISH_MAX_ATTEMPTS = 3
+const REPLENISH_MAX_DELAY_MS = 60_000
+
+type PoolStatus = "connecting" | "ready" | "failed" | "closed"
+
+interface QueueEntry {
+  resolve: (client: Client) => void
+  reject: (err: Error) => void
+}
+
+interface PendingConnect {
+  cancel: () => void
+}
 
 class ConnectionPool {
   private clients: Client[] = []
   private busy = new Set<Client>()
-  private queue: Array<(client: Client) => void> = []
+  private queue: QueueEntry[] = []
   private healthTimer?: NodeJS.Timeout
-  private destroyed = false
+  private status: PoolStatus = "connecting"
   private replenishing = false
+  private pendingConnects = new Set<PendingConnect>()
+  private retrySleepTimer?: NodeJS.Timeout
+  private cancelRetrySleep?: () => void
   ready: Promise<void>
 
   constructor(
@@ -33,20 +51,47 @@ class ConnectionPool {
     private staggerMs: number = 0
   ) {
     this.ready = this.init()
-    this.startHealthCheck()
+    // Avoid an unhandled-rejection warning while still letting callers await
+    // the original (rejecting) promise.
+    this.ready.catch(() => {})
+  }
+
+  private isClosed(): boolean {
+    return this.status === "closed"
   }
 
   private async init(): Promise<void> {
-    // Sequential creation with optional stagger to avoid overwhelming legacy SSH servers
-    for (let i = 0; i < this.size; i++) {
-      await this.createClient()
-      if (this.staggerMs > 0 && i < this.size - 1) {
-        await new Promise((r) => setTimeout(r, this.staggerMs))
+    try {
+      // Sequential creation with optional stagger to avoid overwhelming legacy SSH servers
+      for (let i = 0; i < this.size; i++) {
+        if (this.isClosed()) throw new Error("Connection pool closed")
+        await this.createClient()
+        if (this.staggerMs > 0 && i < this.size - 1) {
+          await this.sleep(this.staggerMs)
+          if (this.isClosed()) throw new Error("Connection pool closed")
+        }
       }
+    } catch (err) {
+      // Do not leave half-open sockets behind when startup fails part-way.
+      this.discardClients()
+      if (!this.isClosed()) this.status = "failed"
+      this.stopHealthCheck()
+      throw err
     }
+
+    if (this.isClosed()) {
+      this.discardClients()
+      throw new Error("Connection pool closed")
+    }
+    // Health checking only makes sense once we actually have connections.
+    this.status = "ready"
+    this.startHealthCheck()
   }
 
   private createClient(): Promise<void> {
+    if (this.isClosed()) {
+      return Promise.reject(new Error("Connection pool closed"))
+    }
     const CREATE_TIMEOUT_MS = 30_000
     return new Promise((resolve, reject) => {
       const client = new Client()
@@ -54,10 +99,23 @@ class ConnectionPool {
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true
+          this.pendingConnects.delete(pending)
           client.end()
           reject(new Error(`SSH connection timeout after ${CREATE_TIMEOUT_MS}ms`))
         }
       }, CREATE_TIMEOUT_MS)
+
+      const pending: PendingConnect = {
+        cancel: () => {
+          if (resolved) return
+          resolved = true
+          this.pendingConnects.delete(pending)
+          clearTimeout(timer)
+          client.end()
+          reject(new Error("Connection pool closed"))
+        },
+      }
+      this.pendingConnects.add(pending)
 
       const connConfig: any = {
         host: this.config.host,
@@ -88,6 +146,7 @@ class ConnectionPool {
         .on("ready", () => {
           if (!resolved) {
             resolved = true
+            this.pendingConnects.delete(pending)
             clearTimeout(timer)
             this.clients.push(client)
             resolve()
@@ -96,7 +155,14 @@ class ConnectionPool {
         .on("error", (err: Error) => {
           if (!resolved) {
             resolved = true
+            this.pendingConnects.delete(pending)
             clearTimeout(timer)
+            // A connection that failed mid-handshake must not keep its socket.
+            try {
+              client.end()
+            } catch {
+              /* ignore */
+            }
             reject(err)
           } else {
             this.removeClient(client)
@@ -119,33 +185,84 @@ class ConnectionPool {
 
   private processQueue(): void {
     while (this.queue.length > 0) {
+      if (this.isClosed()) {
+        this.rejectQueue(new Error("Connection pool closed"))
+        return
+      }
       const free = this.clients.find((c) => !this.busy.has(c))
       if (!free) break
       const next = this.queue.shift()
       if (next) {
         this.busy.add(free)
-        next(free)
+        next.resolve(free)
       }
     }
   }
 
+  private rejectQueue(err: Error): void {
+    const queued = this.queue
+    this.queue = []
+    for (const entry of queued) {
+      entry.reject(err)
+    }
+  }
+
   private startHealthCheck(): void {
+    if (this.status !== "ready" || this.healthTimer) return
     this.healthTimer = setInterval(() => {
-      if (this.destroyed) return
+      if (this.isClosed() || this.status === "failed") return
       this.checkHealth().catch(() => {})
     }, HEALTH_CHECK_INTERVAL_MS)
   }
 
+  private stopHealthCheck(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer)
+      this.healthTimer = undefined
+    }
+  }
+
+  /** Cancel any in-flight backoff sleep so close() is not blocked by it. */
+  private cancelSleep(): void {
+    if (this.retrySleepTimer) {
+      clearTimeout(this.retrySleepTimer)
+      this.retrySleepTimer = undefined
+    }
+    if (this.cancelRetrySleep) {
+      const cancel = this.cancelRetrySleep
+      this.cancelRetrySleep = undefined
+      cancel()
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const finish = () => {
+        if (this.retrySleepTimer) clearTimeout(this.retrySleepTimer)
+        this.retrySleepTimer = undefined
+        this.cancelRetrySleep = undefined
+        resolve()
+      }
+      this.retrySleepTimer = setTimeout(finish, ms)
+      this.cancelRetrySleep = finish
+    })
+  }
+
   private async checkHealth(): Promise<void> {
-    // 1. Replenish missing connections
+    if (this.status !== "ready") return
+
+    // 1. Replenish missing connections (bounded: this call always terminates)
     await this.replenish()
+    if (this.status !== "ready") return
 
     // 2. Ping idle connections to verify they are responsive
     const idleClients = this.clients.filter((c) => !this.busy.has(c))
     for (const client of idleClients) {
+      if (this.status !== "ready") return
       try {
         await this.pingClient(client)
       } catch {
+        if (this.status !== "ready") return
         console.log(
           `[SSHPool] Health check: unresponsive connection replaced (${this.config.host}:${this.config.port})`
         )
@@ -156,32 +273,66 @@ class ConnectionPool {
     }
   }
 
+  /**
+   * Try to fill the pool up to `size`.
+   *
+   * Bounded on purpose: at most REPLENISH_MAX_ATTEMPTS connection attempts per
+   * call, with exponential backoff, and a single summary log when giving up.
+   * A later health check may try again — but this call always returns.
+   */
   private async replenish(): Promise<void> {
+    if (this.isClosed() || this.status === "failed") return
     if (this.replenishing) return
     if (this.clients.length >= this.size) return
 
     this.replenishing = true
+    let failures = 0
+    let lastError: Error | undefined
     try {
-      while (this.clients.length < this.size && !this.destroyed) {
+      while (this.clients.length < this.size && !this.isClosed()) {
+        if (failures >= REPLENISH_MAX_ATTEMPTS) break
+
         try {
           await this.createClient()
+          lastError = undefined
+          continue
         } catch (err) {
-          console.error(
-            `[SSHPool] Failed to create replacement connection: ${(err as Error).message}`
+          lastError = err as Error
+          failures++
+          if (this.isClosed()) break
+          // Log only the first failure of this round; the rest is summarised.
+          if (failures === 1) {
+            console.error(
+              `[SSHPool] Failed to create replacement connection: ${lastError.message}`
+            )
+          }
+          if (failures >= REPLENISH_MAX_ATTEMPTS) break
+
+          const delay = Math.min(
+            CONNECTION_RETRY_DELAY_MS * 2 ** (failures - 1),
+            REPLENISH_MAX_DELAY_MS
           )
-          await new Promise((r) => setTimeout(r, CONNECTION_RETRY_DELAY_MS))
+          await this.sleep(delay)
         }
       }
     } finally {
       this.replenishing = false
     }
+
+    if (lastError && failures >= REPLENISH_MAX_ATTEMPTS && !this.isClosed()) {
+      console.error(
+        `[SSHPool] giving up replenishing after ${failures} attempts: ${lastError.message}`
+      )
+    }
   }
 
   private async replenishOne(): Promise<void> {
-    if (this.clients.length >= this.size || this.destroyed) return
+    if (this.isClosed() || this.status === "failed") return
+    if (this.clients.length >= this.size) return
     try {
       await this.createClient()
     } catch (err) {
+      if (this.isClosed()) return
       console.error(
         `[SSHPool] Failed to replace connection: ${(err as Error).message}`
       )
@@ -225,8 +376,10 @@ class ConnectionPool {
   }
 
   async acquire(): Promise<Client> {
+    if (this.isClosed()) throw new Error("Connection pool destroyed")
+
     await this.ready
-    if (this.destroyed) throw new Error("Connection pool destroyed")
+    if (this.isClosed()) throw new Error("Connection pool destroyed")
 
     // Opportunistically replenish if pool is undersized
     if (this.clients.length < this.size) {
@@ -239,8 +392,12 @@ class ConnectionPool {
       return free
     }
 
-    return new Promise((resolve) => {
-      this.queue.push((client) => resolve(client))
+    return new Promise<Client>((resolve, reject) => {
+      if (this.isClosed()) {
+        reject(new Error("Connection pool closed"))
+        return
+      }
+      this.queue.push({ resolve, reject })
     })
   }
 
@@ -256,18 +413,40 @@ class ConnectionPool {
     this.replenishOne().catch(() => {})
   }
 
-  async close(): Promise<void> {
-    this.destroyed = true
-    if (this.healthTimer) {
-      clearInterval(this.healthTimer)
-      this.healthTimer = undefined
-    }
+  private discardClients(): void {
     for (const client of this.clients) {
-      client.end()
+      try {
+        client.end()
+      } catch {
+        /* ignore */
+      }
     }
     this.clients = []
     this.busy.clear()
-    this.queue = []
+  }
+
+  /** Cancel connections still handshaking so close() does not hang. */
+  private cancelPendingConnects(): void {
+    const pending = Array.from(this.pendingConnects)
+    this.pendingConnects.clear()
+    for (const p of pending) {
+      try {
+        p.cancel()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.isClosed()) return
+    this.status = "closed"
+
+    this.stopHealthCheck()
+    this.cancelSleep()
+    this.cancelPendingConnects()
+    this.discardClients()
+    this.rejectQueue(new Error("Connection pool closed"))
   }
 }
 
@@ -277,23 +456,37 @@ export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
   const staggerMs = parseInt(process.env.REMOTE_POOL_STAGGER_MS || "0", 10)
   const commandPool = new ConnectionPool(config, commandPoolSize, staggerMs)
   const filePool = new ConnectionPool(config, filePoolSize, staggerMs)
-  await Promise.all([commandPool.ready, filePool.ready])
 
   // Setup sudo askpass on remote if needed
   let sudoAskpassPath: string | undefined
-  if (config.sudoPassword) {
-    const mktempResult = await execOnPool(
-      commandPool,
-      "mktemp /tmp/.opencode_sudo_askpass_XXXXXX"
-    )
-    sudoAskpassPath = mktempResult.stdout.trim()
-    const escaped = config.sudoPassword.replace(/'/g, "'\"'\"'")
-    await execOnPool(
-      commandPool,
-      `cat > ${quoteShell(sudoAskpassPath)} << 'EOF'\n#!/bin/sh\necho '${escaped}'\nEOF\nchmod 700 ${quoteShell(sudoAskpassPath)}`
-    )
+  try {
+    await Promise.all([commandPool.ready, filePool.ready])
+
+    if (config.sudoPassword) {
+      const mktempResult = await execOnPool(
+        commandPool,
+        "mktemp /tmp/.opencode_sudo_askpass_XXXXXX"
+      )
+      sudoAskpassPath = mktempResult.stdout.trim()
+      const escaped = config.sudoPassword.replace(/'/g, "'\"'\"'")
+      await execOnPool(
+        commandPool,
+        `cat > ${quoteShell(sudoAskpassPath)} << 'EOF'\n#!/bin/sh\necho '${escaped}'\nEOF\nchmod 700 ${quoteShell(sudoAskpassPath)}`
+      )
+    }
+  } catch (err) {
+    // Startup failed: never leak the pools that did come up (sockets + timers).
+    if (sudoAskpassPath) {
+      await execOnPool(commandPool, `rm -f ${quoteShell(sudoAskpassPath)}`).catch(
+        () => {}
+      )
+    }
+    await commandPool.close().catch(() => {})
+    await filePool.close().catch(() => {})
+    throw err
   }
 
+  let closed = false
   return {
     async exec(command, options = {}) {
       let shellCommand = command
@@ -339,8 +532,12 @@ export async function createSSHPool(config: RemoteConfig): Promise<SSHPool> {
     },
 
     async close() {
+      if (closed) return
+      closed = true
       if (sudoAskpassPath) {
-        await execOnPool(commandPool, `rm -f ${sudoAskpassPath}`).catch(() => {})
+        await execOnPool(commandPool, `rm -f ${quoteShell(sudoAskpassPath)}`).catch(
+          () => {}
+        )
       }
       await Promise.all([commandPool.close(), filePool.close()])
     },

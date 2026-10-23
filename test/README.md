@@ -6,15 +6,20 @@
 ## 怎么跑
 
 ```powershell
-node test/run-tests.mjs              # 总入口：清 tmp → 起服务 → 跑全部断言
+npm run build                        # 单元套件 import dist/，必须先构建
+node test/run-tests.mjs              # 总入口：清 tmp → 跑单元套件 → 起服务 → 跑全部断言
 node test/run-tests.mjs --verbose    # 打印每条 SSH/SFTP 请求
 node test/run-tests.mjs --skip-plugin
+node test/run-tests.mjs --skip-slow  # 跳过 ssh-pool 生命周期套件（它要等约 25s 的定时器）
 node test/verify-mock-server.mjs     # 只验证假服务器本身（自己起服务、自己关）
+node test/path-mapper.mjs            # 只跑镜像路径映射的单元断言
+node test/ssh-pool-lifecycle.mjs     # 只跑连接池生命周期/泄漏断言
 ```
 
 - 全部通过时 exit 0，否则 exit 1。
 - 所有断言只依赖 stdio，不连任何外部服务。
 - 默认账号：`testuser` / `testpass`（可用 `MOCK_SSH_USER` / `MOCK_SSH_PASSWORD` 覆盖）。
+- 当前基线：`total: PASS=42 FAIL=0 SKIP=0`（约 35s）。
 
 ## 文件
 
@@ -23,7 +28,9 @@ node test/verify-mock-server.mjs     # 只验证假服务器本身（自己起�
 | `mock-ssh-server.mjs` | 假 SSH 服务器：密码认证、exec、shell（假）、SFTP 子集；导出 `startMockServer()` → `{ port, close() }` |
 | `verify-mock-server.mjs` | 用 `ssh2` Client 连自己，验证认证 / exec / SFTP / 路径穿越防护 |
 | `plugin-smoke.mjs` | 用假 V2 `ctx` 加载 `dist/index.js`，断言注册出 7 个工具 |
-| `run-tests.mjs` | 总入口：清理 `test/tmp`、起服务、跑上面两个、汇总 PASS/FAIL/SKIP |
+| `path-mapper.mjs` | `PathMapper` 单元断言：`workdir: "/"` 边界、尾斜杠、相对路径报错、`toLocal`↔`toRemote` 往返、镜像基目录互不嵌套 |
+| `ssh-pool-lifecycle.mjs` | 连接池生命周期：连不上时不泄漏定时器、进程能自然退出、`close()` 幂等、排队者在 close 时被 reject、`replenish()` 有界终止 |
+| `run-tests.mjs` | 总入口：清理 `test/tmp`、用子进程跑上面两个单元套件、起服务跑 `verify-mock-server` + `plugin-smoke`、汇总 PASS/FAIL/SKIP |
 
 ## `test/tmp` 是临时的
 
@@ -61,12 +68,12 @@ test/tmp/mirror/   插件本地镜像目录（避免污染 ~/.opencode/mirrors�
 
 ## 插件冒烟测试的 SKIP 规则
 
-插件正在从 V1 移植到 V2。`dist/index.js` 只要不是 V2 形态（默认导出是函数、或
-`{ id, server }`）、或者根本导入失败（例如 dist 还没 build 完），冒烟测试就打印 **SKIP**
-并说明原因，**不会**让整套测试失败。只有在它"声称自己是 V2"（有 `setup`/`effect`）之后
-才做真断言：注册 `shell read write edit patch glob grep` 七个工具且都有 `execute`，
-然后额外用 `shell` 工具跑一次 `echo plugin-smoke-ok`（走假 SSH 的 exec 通道，软失败），
-最后调用 `setup` 返回的清理函数。
+插件现在已经是 V2 形态（`Plugin.define({ id, setup })`）。SKIP 只是给"还没 `npm run build`"
+这种情况留的兜底：`dist/index.js` 不存在、导入失败、或默认导出不是 V2 形态（是函数，或
+`{ id, server }`）时，冒烟测试打印 **SKIP** 并说明原因，**不会**让整套测试失败。
+正常构建后它一定会做真断言：注册 `shell read write edit patch glob grep` 七个工具且都有
+`execute`，然后额外用 `shell` 工具跑一次 `echo plugin-smoke-ok`（走假 SSH 的 exec 通道，
+软失败），最后调用 `setup` 返回的清理函数。
 
 假 `ctx` 里 `tool.transform` / `session.hook` 都返回 `{ dispose }`（V2 的 `Registration`），
 `options.mirror` 指向 `test/tmp/mirror`，所以插件不会写用户目录下的

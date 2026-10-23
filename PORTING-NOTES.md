@@ -323,17 +323,29 @@ RESULT: PASS
 2. **配置错误不抛异常**。`ssh` 有、`workdir` 没有这种半配置，`console.error` 一行后 return，
    避免把宿主的插件加载搞崩；但**已配置且连不上 SSH 时是 `setup` reject**（故意不静默退回本地模式——
    否则 AI 会以为在操作远端、实际改本地文件）。
-3. **已知遗留（未修，属 ssh-pool.ts）**：连接失败时 `ConnectionPool` 的健康检查定时器会不停
-   `replenish()` 重试（每 5s 打一行 `[SSHPool] Failed to create replacement connection`）。
-   这是 V1 就有的行为，契约要求不动 `ssh-pool.ts`，故保留。
+3. **~~已知遗留：ssh-pool 健康检查无限重试~~（已修复）**。原实现里 `ConnectionPool` 构造函数
+   无条件 `startHealthCheck()`，`init()` 失败后 30s interval 仍在；`replenish()` 的
+   `while` 循环失败后固定 sleep 5s、永不退出。现在改为 `status: connecting|ready|failed|closed`
+   状态机：健康检查只在 `init()` 成功后启动；`replenish()` 单轮最多 3 次尝试、退避 5s→10s→20s、
+   只打「首次失败」和「放弃」两条日志；`createSSHPool()` 启动失败会关闭已建好的池再 rethrow；
+   `close()` 幂等，并且会 reject 排队中的 `acquire()`（原来是直接丢队列，工具调用会永久挂起）。
+   回归测试：`test/ssh-pool-lifecycle.mjs`。
 4. **title 请求跳过注入**。`event.system` 只有 title generator 一个 part 时直接 return，
    避免每次生成标题都额外跑一次 SSH（`buildRemoteSystemPrompt` 会 `cat` 远端 AGENTS.md）。
    有 title generator 但也有其他 part 时，按 V1 语义替换其余部分。
 5. **`exports` 增加 `"."`**。原 `package.json` 只有 `"./server"`，而 V2 是按包名 `import` 插件包的，
    只有子路径导出会解析失败；`main` 在有 `exports` 时不生效。保留 `"./server"` 兼容旧写法。
-6. **`workdir: "/"` 的边界 bug（未修，属 path-mapper.ts）**：`isWithinWorkspace()` 用
+6. **~~`workdir: "/"` 的边界 bug~~（已修复）**：`isWithinWorkspace()` 原来用
    `normalized.startsWith(remoteRoot + "/")`，当 `remoteRoot === "/"` 时拼出 `"//"`，
-   于是所有路径都被判定为「工作区外」，多弹一次权限。真机上把 workdir 写成 `/home/xxx` 不受影响。
+   于是所有路径都被判定为「工作区外」，每读写一个文件都多弹一次权限。
+   现在统一走 `isInsideRoot()`：根目录显式判断，非根用 `=== root || startsWith(root + "/")`。
+   顺带修掉三个同源性缺陷：`remoteWorkdir` 尾斜杠（`/home/proj/`）会让 `startsWith` 恒假；
+   构造函数改为归一化一次（`posix.normalize` + 去尾斜杠）并校验必须绝对，
+   相对路径直接抛错而不是静默算出错误镜像；`slugify("/")` 原返回空串，会让 `mirrorBase`
+   少一级、成为其它 workdir 镜像基目录的前缀，而 `index.ts` 每次启动 `rm -rf mirrorBase`——
+   现在空 slug 回落为 `"root"`。另外 `toRemote(toLocal(p))` 在「外部路径」上原本不精确
+   （`/home/proj` 下 `/etc/passwd` 与 `proj/etc/passwd` 共用镜像路径），用一张只做记账的
+   `outsidePaths` Map 修好。回归测试：`test/path-mapper.mjs`。
 7. **`zod` 已从 devDependencies 移除**：工具 schema 是纯 JSON Schema，`tool.schema` 不再存在；
    同理不需要 `effect` 依赖（`AssertInput` 只做类型引用）。
 8. **测试脚本一并改签名**。`src/test-e2e.ts` / `src/test-extended.ts` 在 `tsconfig` 的 `include` 里，
@@ -343,6 +355,11 @@ RESULT: PASS
    （见 `test/README.md`），所以 `read`（远端 `file -b` / `dd` 判类型）、`glob`/`grep`
    （`cd <dir> && rg`）无法在该装置上端到端验证，只验证了注册与外壳；`write`/`edit`/`patch`
    走 SFTP，已完整验证。
-10. **文档遗留**：`README.md` / `README.zh-CN.md` / `AGENTS.md` 仍把「仅环境变量激活」写成唯一方式。
-    移植后 `opencode.jsonc` 的 `plugins[].options` 才是主路径，env 降级为兼容回退，文档待更新
-    （本次任务未要求改文档，故未动）。
+10. **~~文档遗留~~（已修复）**：`AGENTS.md` 与三个 launcher 原先仍把「仅环境变量激活」写成唯一方式。
+    现在 `AGENTS.md` 已按 V2 重写（`shell`/`patch`、`Plugin.define({id, setup})`、
+    `ctx.permission.assert`、`ctx.session.hook("context")`、`opencode.jsonc` 的
+    `plugins[].options` 优先），并顺手修正了上游的事实错误（`pullAll`/`pushAll` 写的是 rsync、
+    实际是 SFTP `fastGet`/`fastPut`；本 fork 没有 `dist/tui.jsx`）。launcher 保留「按远端目标
+    钉一个稳定的本地会话目录」这个核心用途，但会明确提示真正的远端配置在 `opencode.jsonc` 里，
+    `REMOTE_*` 导出只在 `opencode run --standalone` 下生效。两个 README 保持上游正文不动，
+    只在顶部加 V2 警示块指向本文件与 `MIGRATION-V2.md`。

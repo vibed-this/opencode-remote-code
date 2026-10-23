@@ -10,6 +10,10 @@
 > shell environment. See **[PORTING-NOTES.md](PORTING-NOTES.md)** for the working
 > config, and **[MIGRATION-V2.md](MIGRATION-V2.md)** for the verified V1→V2 API contract.
 > The sections below are kept from upstream and describe the V1 behaviour.
+> In particular, the "Launcher scripts" / "Usage" instructions below (editing
+> `REMOTE_SSH` inside a launcher) are **no longer how remote mode is enabled**:
+> the launchers now only pin a stable local session directory and print a hint;
+> their `REMOTE_*` exports still work for `opencode run --standalone` only.
 > Forked from [zz6zz666/opencode-remote-code](https://github.com/zz6zz666/opencode-remote-code).
 
 An OpenCode plugin that lets AI agents operate remote machines over SSH — with **zero footprint** on the remote side. The remote machine only needs `sshd`; no agent, runtime, or dependency installation is required.

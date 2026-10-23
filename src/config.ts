@@ -210,6 +210,16 @@ export function loadConfig(options?: Record<string, unknown>): RemoteConfig | nu
     )
   }
 
+  // The remote workdir must be an absolute POSIX path: PathMapper derives the
+  // local mirror layout from it, and a relative value would silently produce a
+  // wrong mirror path (and a broken workspace boundary check).
+  if (!path.posix.isAbsolute(path.posix.normalize(workdir.value))) {
+    throw new Error(
+      `Remote Code: remote working directory must be absolute, got "${workdir.value}" ` +
+        `(set the "workdir" plugin option to something like "/home/project")`
+    )
+  }
+
   const mirror = resolveConfigValue("mirror", options, argv)
   const password = resolveConfigValue("password", options, argv)
   const sudoPassword = resolveConfigValue("sudoPassword", options, argv)

@@ -1,6 +1,6 @@
 {
   "name": "opencode-remote-code",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenCode plugin for remote machine control over SSH",
   "type": "module",
   "main": "dist/index.js",

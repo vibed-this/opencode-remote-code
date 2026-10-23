@@ -9,6 +9,9 @@
 > 继承不到你 shell 的环境变量。可用配置见 **[PORTING-NOTES.md](PORTING-NOTES.md)**，
 > 实测的 V1→V2 API 契约见 **[MIGRATION-V2.md](MIGRATION-V2.md)**。
 > 以下正文来自上游，描述的是 V1 的行为。
+> 特别地，下文「启动脚本」/「使用方式」里"编辑脚本里的 `REMOTE_SSH`"**已不是启用远程
+> 模式的方式**：现在的启动脚本只负责钉住本地会话目录并打印一句提示，其导出的 `REMOTE_*`
+> 变量仅对 `opencode run --standalone` 有效。
 > Fork 自 [zz6zz666/opencode-remote-code](https://github.com/zz6zz666/opencode-remote-code)。
 
 一款 OpenCode 插件，让 AI Agent 能够通过 SSH 直接操控远程机器——**远程端零依赖**，仅需 SSH 守护进程即可。无需在远程安装任何 agent、运行时或依赖。
