@@ -111,6 +111,8 @@ if (options.help) {
  * assertions and finish in well under a second each.
  */
 const UNIT_SUITES = [
+  { script: "cli.mjs", label: "CLI suite", slow: false },
+  { script: "runtime-router.mjs", label: "runtime routing suite", slow: false },
   { script: "remote-path.mjs", label: "remote path suite", slow: false },
   { script: "dialect.mjs", label: "dialect suite", slow: false },
   { script: "glob-matcher.mjs", label: "glob matcher suite", slow: false },
@@ -118,6 +120,7 @@ const UNIT_SUITES = [
   { script: "config-activate.mjs", label: "config / activateIn suite", slow: false },
   { script: "path-mapper.mjs", label: "path-mapper suite", slow: false },
   { script: "plugin-entry.mjs", label: "plugin entry suite", slow: false },
+  { script: "ssh-agent-auth.mjs", label: "SSH-agent authentication suite", slow: false },
   { script: "ssh-pool-lifecycle.mjs", label: "ssh-pool lifecycle suite", slow: true },
 ]
 

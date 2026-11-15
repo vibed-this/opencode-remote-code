@@ -28,6 +28,161 @@ on the remote machine.
 
 ---
 
+## Runtime target selection (opt-in)
+
+### Local CLI: `remote-opencode`
+
+Build/install this package to put `remote-opencode` on PATH (`npm run build && npm link`
+from a checkout). Requires Node.js 20+ and OpenCode V2 on PATH; tested with OpenCode
+2.2.7 and the pinned `@opencode/client` 2.2.7 API.
+
+Register the plugin once in your OpenCode configuration, with **no target address**:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    { "package": "/absolute/path/to/opencode-remote-code", "options": { "runtime": true } }
+  ]
+}
+```
+
+Use the installed package name instead of the absolute path for an npm installation.
+The registration must apply to `~/.opencode/remote-sessions/` (global config, or
+an ancestor config there). The CLI never edits your configuration. A legacy
+registration with a fixed `host`/`ssh` cannot be combined with runtime mode.
+
+```sh
+remote-opencode alice@server.example --workdir /srv/project
+remote-opencode server.example --user alice --port 2222 --workdir /srv/project
+remote-opencode server.example --key ~/.ssh/id_ed25519 --workdir /srv/project
+```
+
+Without `--key`, the CLI requires the calling terminal's `SSH_AUTH_SOCK` and sends
+it explicitly as `agentSocket` through `remote-code.runtime`. This overrides a
+missing/stale agent environment in the background service. The socket must remain
+accessible to that **local** service; it is not forwarded to the SSH host. Unlock
+the key in your agent first. Password prompting and encrypted-key passphrases are
+not implemented by the launcher.
+
+The CLI discovers/starts the local service with `Service.ensure()`, creates a local
+session in a stable directory keyed by host/port/user/workdir, initializes session
+plugins with `/remote status`, connects through the typed RPC, then runs
+`opencode <local-directory> --server <discovered-url> --session <id>`. Service
+authentication is passed in the child environment, never command-line arguments.
+The engine, model-provider credentials and session database stay local. Only
+SSH/SFTP reaches the target. The CLI accepts no remote OpenCode server option.
+
+A failed connection exits nonzero without opening the TUI. Failed remote sessions
+remain blocked rather than falling back to local file/shell tools. Each invocation
+creates a new session unless `--session ses_...` is supplied with the same target
+arguments. `--session` reconnects a failed/disconnected session (including after a
+service restart); an already connected session must first be explicitly disconnected
+with `/remote disconnect`. Closing the TUI does **not** disconnect or switch tools
+back to local mode. `/remote status` shows the current state.
+
+**Hostnames must be real DNS names or IP addresses.** The CLI does not read SSH
+config aliases, `IdentityAgent`, `ProxyJump` or `ProxyCommand`, and does not run
+`ssh -G` (which can execute `Match exec` configuration). Expand the hostname/user/port
+yourself or establish a local tunnel separately. Workdir defaults to the remote
+login home; quote paths containing spaces. Existing `launchers/remote-opencode.*`
+scripts retain their legacy directory-only behavior and are separate from this
+package's CLI binary. End-to-end launcher verification currently covers Linux;
+Windows terminal/agent attachment has not been verified.
+
+### RPC and in-session commands
+
+Configure the plugin once, without a target address:
+
+```jsonc
+{
+  "plugins": [{
+    "package": "/absolute/path/to/opencode-remote-code",
+    "options": { "runtime": true }
+  }]
+}
+```
+
+Then use the real server command in a session:
+
+```text
+/remote connect {"ssh":"user@host","workdir":"~/project"}
+/remote status
+/remote disconnect
+```
+
+`connect` also accepts structured `host`, `port`, `user`, `key`, `agentSocket`,
+`workdir`, `platform`, and `shell`. Paths for keys and agent sockets are on the
+**OpenCode server**, not a remote CLI client. `agentSocket` integrates with the
+separate agent-socket authentication feature; builds lacking that feature reject
+an explicit socket instead of ignoring it. Use RPC for passwords, not slash-command
+text. Runtime targets and credentials are not saved to configuration or plugin
+storage. OpenCode can retain command text in its own history.
+
+Sessions start local. Each connected session routes the seven file/shell tools to
+its own SSH pool and mirror; another session at the **same local directory** keeps
+its native tools. Native tool schemas and native local executors are preserved.
+Only execution and remote-session descriptions/context are changed. `status`
+reports selection/setup state, not an SSH health probe.
+
+Connection failures block that session's file/shell tools until a successful
+reconnect or explicit disconnect. A remote tool failure never retries locally.
+Calls captured before a target change fail rather than running on the new target.
+Target changes are rejected while a routed tool is active or a connection is
+pending. Disconnect first before choosing a different connected target.
+
+Pools close on disconnect, session deletion, and plugin unload; runtime mirror
+files are removed on close. Only a per-session **blocked marker** survives reload:
+after a restart, previously remote sessions require reconnect or disconnect and
+cannot silently become local. Keep runtime mode enabled for that protection.
+Disabling/uninstalling the plugin restores OpenCode's normal native behavior.
+
+Runtime mode does not move the OpenCode session or virtualize the entire host:
+UI file attachments, references, UI terminals/shell shortcuts, other plugins, and
+non-file/shell tools remain host features. Remote background shell execution is unsupported. Subagent
+delegation from remote sessions is disabled to avoid creating an implicitly local
+child; connect another session explicitly. Windows runtime routing uses the same
+backend but has not been exercised by the Linux real-host test.
+
+Without `runtime: true`, existing configured-target and `activateIn` behavior is
+unchanged, including the dormant no-target path. Do not mix runtime mode with a
+configured `ssh`/`host`. Non-target defaults such as limits, pool size, mirror root,
+and activation scope can still be supplied in plugin options.
+
+### Runtime interface for CLI/UI integrations
+
+Import `RemoteRuntime` from `opencode-remote-code/rpc` and use the existing
+authenticated OpenCode client at the session's location:
+
+```ts
+import { RemoteRuntime } from "opencode-remote-code/rpc"
+
+const remote = client.rpc(RemoteRuntime)
+await remote.connect({
+  sessionID,
+  target: { host: "build.example", user: "dev", workdir: "~/repo",
+    agentSocket: "/run/user/1000/openssh_agent" },
+})
+await remote.status({ sessionID })
+await remote.disconnect({ sessionID })
+```
+
+RPC ID: `remote-code.runtime`. All methods return `{ sessionID, phase }`, with
+`host`, `port`, `user`, `workdir`, and `platform` when connected. Phases are
+`local`, `connecting`, `connected`, `failed`. Expected errors use
+`operation_failed`; credentials are never returned. The exported TypeScript
+interfaces are `RuntimeTarget`, `RuntimeConnectInput`, `RuntimeSessionInput`, and
+`RuntimeStatus`. RPC schemas reject unknown target fields; JSON Schema RPC values
+are `unknown` in the SDK, so callers should narrow results to these interfaces.
+
+Implementation references: official V2 [server commands, transforms and hooks](https://opencode.ai/docs/build/plugins/server),
+[RPC](https://opencode.ai/docs/build/plugins/rpc), and [CLI extension](https://opencode.ai/docs/build/plugins/cli)
+docs. Types were checked against installed `@opencode/plugin` 2.3.0; native
+executor delegation and all seven routed tools are exercised against a real
+OpenCode 2.2.7 server. Tool transforms themselves are location-scoped; session
+isolation is implemented by the checked `sessionID` dispatcher, not claimed as a
+host transform feature.
+
 ## 💡 Why Remote Code?
 
 I am an analog IC engineer. My daily work relies on the **Cadence IC6.1.7 design suite**, which
@@ -253,6 +408,34 @@ Structured form (alternative to the string — use one or the other):
 If both forms are present and disagree on host / port / user / identity, `loadConfig()` throws
 rather than picking a winner.
 
+### Local SSH-agent authentication
+
+When neither `key` nor `password` is supplied, both the command and SFTP pools authenticate
+through a local SSH agent using `agentSocket`, or the service's `SSH_AUTH_SOCK` by default:
+
+```jsonc
+{ "ssh": "ssh me@192.0.2.10", "agentSocket": "/run/user/1000/ssh-agent.socket" }
+```
+
+This is a **local runtime socket**, not a remote path or a private key. The agent must already
+be running, accessible to the service user, and hold an unlocked key authorized on the server.
+The plugin never starts an agent, loads keys into it, or forwards it to the remote host
+(even with `ssh -A`). Exec and SFTP continue to use the existing ssh2 transport.
+
+OpenCode's shared background service does not inherit environment changes from the terminal
+that later connects to it. A working terminal `ssh` therefore does not guarantee that the
+service has `SSH_AUTH_SOCK`. Pass the actual socket explicitly with `agentSocket` in that case;
+the string `$SSH_AUTH_SOCK` is not expanded. Update it if your agent's socket changes.
+Runtime connection callers can pass the same `agentSocket` field directly; a future CLI can
+capture its caller's environment and send this value explicitly. No CLI capture is added here.
+
+Credential precedence remains **key → password → agent**, with no new fallback between them.
+Within agent authentication, an explicit socket wins over the service environment; an invalid
+explicit socket does not fall back. Missing sockets and failed agent authentication report
+guidance about the service environment, loaded keys, and server authorization. Agent socket
+paths are not included in debug summaries. Unix sockets are integration-tested on Linux;
+Windows agent endpoints and interactive hardware-key confirmation are not verified.
+
 ### Option reference
 
 Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, kebab-case accepted).
@@ -265,6 +448,7 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | User | `user` | your local OS user name |
 | Identity file | `key`, `identityFile`, `identity`, `keyFile`, `key-file`, `identity-file` | none → ssh-agent / password |
 | Password | `password` | none |
+| Local SSH-agent socket | `agentSocket`, `agent-socket` | service `SSH_AUTH_SOCK` when no key/password |
 | Remote workdir | `workdir`, `remoteWorkdir`, `remote-workdir`, `remote_workdir` | login home (SFTP `realpath(".")`) |
 | Platform | `platform` | `"auto"` (`auto` \| `windows` \| `posix`) |
 | Shell | `shell` | `"auto"` → `pwsh.exe` if found, else `powershell.exe` (Windows); `bash` (POSIX) |
