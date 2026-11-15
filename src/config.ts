@@ -41,6 +41,8 @@ export interface RemoteConfig {
   /** Identity file path (local, expanded with `~`). */
   identity?: string
   password?: string
+  /** Local SSH-agent endpoint; resolved by the transport, never forwarded. */
+  agentSocket?: string
   /** OpenSSH options we could map onto ssh2, as `["-o","Key=Value", …]`. */
   extraOptions: string[]
   /** Remote workdir. Optional: when absent the plugin uses the login home. */
@@ -92,6 +94,7 @@ const OPTION_KEYS = {
   user: ["user"],
   identity: ["key", "identityFile", "identity", "keyFile", "key-file", "identity-file"],
   password: ["password"],
+  agentSocket: ["agentSocket", "agent-socket"],
   workdir: ["workdir", "remoteWorkdir", "remote-workdir", "remote_workdir"],
   platform: ["platform"],
   shell: ["shell"],
@@ -737,6 +740,11 @@ export function loadConfig(options?: Record<string, unknown>): RemoteConfig | nu
   const structuredUser = readString(opts, OPTION_KEYS.user)
   const structuredIdentity = readString(opts, OPTION_KEYS.identity)
   const structuredPassword = readString(opts, OPTION_KEYS.password)
+  const agentHit = readRaw(opts, OPTION_KEYS.agentSocket)
+  if (agentHit && (typeof agentHit.value !== "string" || !agentHit.value.trim() || agentHit.value.includes("\0"))) {
+    throw new Error('Remote Code: "agentSocket" must be a non-empty local SSH-agent socket path.')
+  }
+  const agentSocket = readString(opts, OPTION_KEYS.agentSocket)
 
   const fromSsh = sshString === undefined ? undefined : parseSshTarget(sshString)
 
@@ -847,6 +855,7 @@ export function loadConfig(options?: Record<string, unknown>): RemoteConfig | nu
     user,
     ...(identity === undefined ? {} : { identity }),
     ...(structuredPassword === undefined ? {} : { password: structuredPassword }),
+    ...(agentSocket === undefined ? {} : { agentSocket: expandHome(agentSocket) }),
     extraOptions: fromSsh?.extraOptions ?? [],
     ...(workdir === undefined ? {} : { workdir }),
     platform,

@@ -1,6 +1,6 @@
 import { Client, type SFTPWrapper } from "ssh2"
-import { readFileSync } from "fs"
 import type { RemoteConfig } from "./config.js"
+import { resolveSSHAuth, agentAuthenticationError } from "./ssh-auth.js"
 
 export interface SSHPool {
   /**
@@ -102,11 +102,14 @@ class ConnectionPool {
     this.startHealthCheck()
   }
 
-  private createClient(): Promise<void> {
+  private async createClient(): Promise<void> {
     if (this.isClosed()) {
       return Promise.reject(new Error("Connection pool closed"))
     }
     const CREATE_TIMEOUT_MS = 30_000
+    // Resolve before allocating timers/sockets so unavailable credentials cannot
+    // leak a pending connection. Both exec and SFTP use this same auth path.
+    const auth = resolveSSHAuth(this.config)
     return new Promise((resolve, reject) => {
       const client = new Client()
       let resolved = false
@@ -132,6 +135,7 @@ class ConnectionPool {
       this.pendingConnects.add(pending)
 
       const connConfig: any = {
+        ...auth,
         host: this.config.host,
         port: this.config.port,
         username: this.config.user,
@@ -148,12 +152,6 @@ class ConnectionPool {
           connConfig.hostVerifier = () => true
           i++
         }
-      }
-
-      if (this.config.identity) {
-        connConfig.privateKey = readFileSync(this.config.identity)
-      } else if (this.config.password) {
-        connConfig.password = this.config.password
       }
 
       client
@@ -177,7 +175,8 @@ class ConnectionPool {
             } catch {
               /* ignore */
             }
-            reject(err)
+            reject(auth.agent && (err as Error & { level?: string }).level === "client-authentication"
+              ? agentAuthenticationError(err) : err)
           } else {
             this.removeClient(client)
             client.end()
@@ -188,7 +187,11 @@ class ConnectionPool {
           this.processQueue()
         })
 
-      client.connect(connConfig)
+      try {
+        client.connect(connConfig)
+      } catch (err) {
+        client.emit("error", err)
+      }
     })
   }
 

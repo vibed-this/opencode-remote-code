@@ -15,7 +15,7 @@ This fork targets **OpenCode V2** (`@opencode/plugin` ^2.1.2). Historical docume
 
 ### Configuration: plugin options only
 
-Remote mode is activated by the plugin's **`options`** in `opencode.jsonc`. Nothing else is read — no environment variables, no argv. V2 plugins run inside a **shared background service** process started independently of your shell, so `export REMOTE_SSH=…` is invisible there (`process.env.REMOTE_SSH === undefined`, measured); keeping the fallback only produced "why is my env ignored?" bugs, so 3.0.0 deleted it.
+Remote mode is activated by the plugin's **`options`** in `opencode.jsonc`, not environment variables or argv. Authentication alone may default to the service's `SSH_AUTH_SOCK` when no key/password is configured; explicit `agentSocket` overrides it. V2 plugins run inside a **shared background service** process started independently of your shell, so terminal environment changes do not reach it. Runtime connection callers should pass the actual local socket with `agentSocket`. The plugin never forwards the agent or loads keys into it.
 
 With **no** `ssh` and no `host` option the plugin is fully **dormant**: no SSH connection, no tool registration, no files written, OpenCode runs normally in local mode. This is a hard design requirement, and `loadConfig()` has no side effects on that path (not even a log line).
 
@@ -172,6 +172,7 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | User | `user` | the local OS user name (OpenSSH's own default) |
 | Identity file | `key`, `identityFile`, `identity`, `keyFile`, `key-file`, `identity-file` | none → ssh-agent / password |
 | Password | `password` | none |
+| Local SSH-agent socket | `agentSocket`, `agent-socket` | service `SSH_AUTH_SOCK` when no key/password |
 | Remote workdir | `workdir`, `remoteWorkdir`, `remote-workdir`, `remote_workdir` | login home |
 | Platform | `platform` | `"auto"` (`auto` \| `windows` \| `posix`; anything else throws) |
 | Shell | `shell` | `"auto"` → `pwsh.exe` when found, else `powershell.exe` (Windows); `bash` (POSIX) |
@@ -358,6 +359,8 @@ The plugin uses the pure-Node.js `ssh2` library; no external `ssh`, `sshpass` or
 - `options.pool.stagger` (default 0 ms) delays sequential handshakes for servers that dislike connection bursts.
 
 Pool defaults are deliberately conservative. A pool whose connect fails rejects all waiters and leaves no timers behind (`test/ssh-pool-lifecycle.mjs` guards that).
+
+`src/ssh-auth.ts` resolves authentication for both pools at connection time. Precedence is identity file → password → agent (explicit `agentSocket`, otherwise service `SSH_AUTH_SOCK`), with no credential fallback. Missing/unavailable agents give actionable errors; forwarding is explicitly disabled. `test/ssh-agent-auth.mjs` uses a temporary real OpenSSH agent and generated key against a signature-verifying ssh2 server, exercising exec and SFTP without touching the user's keys or agent.
 
 `options.debug: true` appends to `~/.opencode/remote-code-debug.log` (the directory is created lazily; logging never throws; when disabled `log()` is a no-op). Nothing secret is logged — `auth=password|key|agent`, never the password or the identity path.
 

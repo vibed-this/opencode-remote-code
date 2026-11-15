@@ -253,6 +253,34 @@ Structured form (alternative to the string — use one or the other):
 If both forms are present and disagree on host / port / user / identity, `loadConfig()` throws
 rather than picking a winner.
 
+### Local SSH-agent authentication
+
+When neither `key` nor `password` is supplied, both the command and SFTP pools authenticate
+through a local SSH agent using `agentSocket`, or the service's `SSH_AUTH_SOCK` by default:
+
+```jsonc
+{ "ssh": "ssh me@192.0.2.10", "agentSocket": "/run/user/1000/ssh-agent.socket" }
+```
+
+This is a **local runtime socket**, not a remote path or a private key. The agent must already
+be running, accessible to the service user, and hold an unlocked key authorized on the server.
+The plugin never starts an agent, loads keys into it, or forwards it to the remote host
+(even with `ssh -A`). Exec and SFTP continue to use the existing ssh2 transport.
+
+OpenCode's shared background service does not inherit environment changes from the terminal
+that later connects to it. A working terminal `ssh` therefore does not guarantee that the
+service has `SSH_AUTH_SOCK`. Pass the actual socket explicitly with `agentSocket` in that case;
+the string `$SSH_AUTH_SOCK` is not expanded. Update it if your agent's socket changes.
+Runtime connection callers can pass the same `agentSocket` field directly; a future CLI can
+capture its caller's environment and send this value explicitly. No CLI capture is added here.
+
+Credential precedence remains **key → password → agent**, with no new fallback between them.
+Within agent authentication, an explicit socket wins over the service environment; an invalid
+explicit socket does not fall back. Missing sockets and failed agent authentication report
+guidance about the service environment, loaded keys, and server authorization. Agent socket
+paths are not included in debug summaries. Unix sockets are integration-tested on Linux;
+Windows agent endpoints and interactive hardware-key confirmation are not verified.
+
 ### Option reference
 
 Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, kebab-case accepted).
@@ -265,6 +293,7 @@ Aliases are resolved by `OPTION_KEYS` in `src/config.ts` (camelCase canonical, k
 | User | `user` | your local OS user name |
 | Identity file | `key`, `identityFile`, `identity`, `keyFile`, `key-file`, `identity-file` | none → ssh-agent / password |
 | Password | `password` | none |
+| Local SSH-agent socket | `agentSocket`, `agent-socket` | service `SSH_AUTH_SOCK` when no key/password |
 | Remote workdir | `workdir`, `remoteWorkdir`, `remote-workdir`, `remote_workdir` | login home (SFTP `realpath(".")`) |
 | Platform | `platform` | `"auto"` (`auto` \| `windows` \| `posix`) |
 | Shell | `shell` | `"auto"` → `pwsh.exe` if found, else `powershell.exe` (Windows); `bash` (POSIX) |

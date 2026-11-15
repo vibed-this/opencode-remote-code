@@ -118,6 +118,7 @@ const UNIT_SUITES = [
   { script: "config-activate.mjs", label: "config / activateIn suite", slow: false },
   { script: "path-mapper.mjs", label: "path-mapper suite", slow: false },
   { script: "plugin-entry.mjs", label: "plugin entry suite", slow: false },
+  { script: "ssh-agent-auth.mjs", label: "SSH-agent authentication suite", slow: false },
   { script: "ssh-pool-lifecycle.mjs", label: "ssh-pool lifecycle suite", slow: true },
 ]
 
