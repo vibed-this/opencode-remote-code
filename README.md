@@ -28,6 +28,99 @@ on the remote machine.
 
 ---
 
+## Runtime target selection (opt-in)
+
+Configure the plugin once, without a target address:
+
+```jsonc
+{
+  "plugins": [{
+    "package": "/absolute/path/to/opencode-remote-code",
+    "options": { "runtime": true }
+  }]
+}
+```
+
+Then use the real server command in a session:
+
+```text
+/remote connect {"ssh":"user@host","workdir":"~/project"}
+/remote status
+/remote disconnect
+```
+
+`connect` also accepts structured `host`, `port`, `user`, `key`, `agentSocket`,
+`workdir`, `platform`, and `shell`. Paths for keys and agent sockets are on the
+**OpenCode server**, not a remote CLI client. `agentSocket` integrates with the
+separate agent-socket authentication feature; builds lacking that feature reject
+an explicit socket instead of ignoring it. Use RPC for passwords, not slash-command
+text. Runtime targets and credentials are not saved to configuration or plugin
+storage. OpenCode can retain command text in its own history.
+
+Sessions start local. Each connected session routes the seven file/shell tools to
+its own SSH pool and mirror; another session at the **same local directory** keeps
+its native tools. Native tool schemas and native local executors are preserved.
+Only execution and remote-session descriptions/context are changed. `status`
+reports selection/setup state, not an SSH health probe.
+
+Connection failures block that session's file/shell tools until a successful
+reconnect or explicit disconnect. A remote tool failure never retries locally.
+Calls captured before a target change fail rather than running on the new target.
+Target changes are rejected while a routed tool is active or a connection is
+pending. Disconnect first before choosing a different connected target.
+
+Pools close on disconnect, session deletion, and plugin unload; runtime mirror
+files are removed on close. Only a per-session **blocked marker** survives reload:
+after a restart, previously remote sessions require reconnect or disconnect and
+cannot silently become local. Keep runtime mode enabled for that protection.
+Disabling/uninstalling the plugin restores OpenCode's normal native behavior.
+
+Runtime mode does not move the OpenCode session or virtualize the entire host:
+UI file attachments, references, UI terminals/shell shortcuts, other plugins, and
+non-file/shell tools remain host features. Remote background shell execution is unsupported. Subagent
+delegation from remote sessions is disabled to avoid creating an implicitly local
+child; connect another session explicitly. Windows runtime routing uses the same
+backend but has not been exercised by the Linux real-host test.
+
+Without `runtime: true`, existing configured-target and `activateIn` behavior is
+unchanged, including the dormant no-target path. Do not mix runtime mode with a
+configured `ssh`/`host`. Non-target defaults such as limits, pool size, mirror root,
+and activation scope can still be supplied in plugin options.
+
+### Runtime interface for CLI/UI integrations
+
+Import `RemoteRuntime` from `opencode-remote-code/rpc` and use the existing
+authenticated OpenCode client at the session's location:
+
+```ts
+import { RemoteRuntime } from "opencode-remote-code/rpc"
+
+const remote = client.rpc(RemoteRuntime)
+await remote.connect({
+  sessionID,
+  target: { host: "build.example", user: "dev", workdir: "~/repo",
+    agentSocket: "/run/user/1000/openssh_agent" },
+})
+await remote.status({ sessionID })
+await remote.disconnect({ sessionID })
+```
+
+RPC ID: `remote-code.runtime`. All methods return `{ sessionID, phase }`, with
+`host`, `port`, `user`, `workdir`, and `platform` when connected. Phases are
+`local`, `connecting`, `connected`, `failed`. Expected errors use
+`operation_failed`; credentials are never returned. The exported TypeScript
+interfaces are `RuntimeTarget`, `RuntimeConnectInput`, `RuntimeSessionInput`, and
+`RuntimeStatus`. RPC schemas reject unknown target fields; JSON Schema RPC values
+are `unknown` in the SDK, so callers should narrow results to these interfaces.
+
+Implementation references: official V2 [server commands, transforms and hooks](https://opencode.ai/docs/build/plugins/server),
+[RPC](https://opencode.ai/docs/build/plugins/rpc), and [CLI extension](https://opencode.ai/docs/build/plugins/cli)
+docs. Types were checked against installed `@opencode/plugin` 2.3.0; native
+executor delegation and all seven routed tools are exercised against a real
+OpenCode 2.2.7 server. Tool transforms themselves are location-scoped; session
+isolation is implemented by the checked `sessionID` dispatcher, not claimed as a
+host transform feature.
+
 ## 💡 Why Remote Code?
 
 I am an analog IC engineer. My daily work relies on the **Cadence IC6.1.7 design suite**, which

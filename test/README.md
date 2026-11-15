@@ -365,3 +365,8 @@ Windows 那一支（`plugin-smoke-windows.mjs`）**不软跳过**：它是端到
 假 `ctx` 里 `tool.transform` / `session.hook` 都返回 `{ dispose }`（V2 的 `Registration`），
 `options.mirror` 指向 `test/tmp/mirror`，所以插件不会写用户目录下的
 `~/.opencode/mirrors`。
+## Runtime routing tests
+
+After `npm run build`, `node test/runtime-router.mjs` checks session isolation,
+failure blocking, stale snapshots across target switches, explicit disconnect, in-flight operations,
+restart markers, and cleanup. It is included in `run-tests.mjs`.
