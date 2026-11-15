@@ -71,7 +71,14 @@ PowerShell（Windows 10+ 自带 5.1），别的一概不需要。
 
 ## 📋 前置要求
 
-- **OpenCode V2**（本分支面向 `@opencode/plugin` ^2.1.2）
+远程模式保留 OpenCode 模型提示词、自定义 agent、skills、Code Mode、MCP 和会话指令。
+仅替换 `core/environment` 和 `core/instructions`：后者整体替换为启动时读取的远程根目录
+`AGENTS.md`，包括替换本地全局及配置的指令文件。通用规则可放入自定义 agent 指令。
+不会自动发现远程子目录指令。generate/compaction 请求含有这些来源时也会更新，title
+请求不受影响。历史记录不变，可能仍包含旧的本地指令更新；远程上下文会明确区分。
+不再内置模型提示词模板。
+
+- **OpenCode 2.2.7+**（`@opencode/plugin` ^2.2.7，需要带键的指令来源元数据）
 - **Node.js ≥ 20**（Bun 亦可）——用于构建插件
 - 远程机器上运行的 **SSH 服务**（**唯一的远程依赖**）
   - POSIX 远端：任意 `sh`/`bash` 登录 shell
@@ -91,7 +98,7 @@ PowerShell（Windows 10+ 自带 5.1），别的一概不需要。
 git clone https://github.com/zz6zz666/opencode-remote-code.git
 cd opencode-remote-code
 npm install
-npm run build            # tsc + scripts/postbuild.cjs（把 src/prompts 拷进 dist/prompts）
+npm run build            # 清理 dist/ 并编译 TypeScript
 ```
 
 ```jsonc

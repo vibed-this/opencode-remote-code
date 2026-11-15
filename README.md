@@ -77,7 +77,22 @@ The two projects share the same zero-footprint SSH motivation, but target differ
 
 ## 📋 Prerequisites
 
-- **OpenCode V2** (this fork targets `@opencode/plugin` ^2.1.2)
+### Remote instruction handling
+
+Remote mode preserves OpenCode's model prompts, custom agents, skills, Code Mode,
+MCP guidance and session instruction entries. It replaces `core/environment` with
+remote OS/shell/workspace details and `core/instructions` with the remote root
+`AGENTS.md`, read once at setup. This replaces the entire discovered-file source,
+including local global/configured instruction files; use custom agents for shared
+policies. Nested remote instruction discovery is not automatic. Generate/compaction
+requests receive the same edits when they contain these sources; title prompts are
+untouched. Stored history is unchanged, so earlier local instruction updates may
+remain in the transcript; remote context explicitly distinguishes them.
+No model-specific prompt templates are bundled.
+
+### Requirements
+
+- **OpenCode 2.2.7+** (`@opencode/plugin` ^2.2.7; keyed instruction-source metadata is required)
 - **Node.js ≥ 20** (or Bun) — for building the plugin
 - An **SSH daemon** on the remote machine (the *only* remote requirement)
   - POSIX remote: any `sh`/`bash` login shell
@@ -98,7 +113,7 @@ The two projects share the same zero-footprint SSH motivation, but target differ
 git clone https://github.com/zz6zz666/opencode-remote-code.git
 cd opencode-remote-code
 npm install
-npm run build            # tsc + scripts/postbuild.cjs (copies src/prompts → dist/prompts)
+npm run build            # clean dist/ and compile TypeScript
 ```
 
 ```jsonc

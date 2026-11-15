@@ -1,126 +1,107 @@
-/**
- * System prompt for remote mode (DESIGN-V3 §10).
- *
- * Supersedes `src/remote-system-prompt.ts` (V2), which did its own SSH round
- * trip (`cat AGENTS.md`) and assumed a POSIX remote. V3 has two rules here:
- *
- * 1. **No IO.** The caller has already probed the remote (platform, shell, git
- *    flag) and read `<workdir>/AGENTS.md` over SFTP; this module is a pure
- *    string builder, so it can be unit-tested and cannot hang a session.
- * 2. **Platform-aware.** On a Windows remote the model must not write
- *    `ls -la` / `cd x && y` / `cat`; `ctx.shellHint` (`RemoteDialect.promptHint()`)
- *    is appended as its own paragraph for exactly that reason.
- */
-import { getProviderPrompt } from "./prompts/index.js"
-
+/** Remote context edits for OpenCode V2's keyed instruction sources. */
 export interface RemotePromptContext {
-  modelID: string
-  /** Canonical remote workdir. */
   remoteRoot: string
   platform: "posix" | "windows"
-  /** "bash" | "PowerShell 5.1" | … */
   shellName: string
-  /** Extra dialect instructions (`dialect.promptHint()`), empty for posix. */
   shellHint: string
   isGitRepo: boolean
-  /** Contents of `<workdir>/AGENTS.md`, already read over SFTP by the caller. */
+  /** Contents of <remoteRoot>/AGENTS.md, read over SFTP during setup. */
   agentsMd?: string
 }
 
-/**
- * `<workdir>/AGENTS.md` without doubling the separator: canonical remote paths
- * have no trailing slash except for the roots `"/"` and `"C:/"`.
- */
-function joinRemoteFileName(root: string, name: string): string {
-  const base = root.replace(/[/\\]+$/, "")
-  return base === "" ? `/${name}` : `${base}/${name}`
+interface InstructionSource {
+  key: string
+  text: string
 }
 
-function isPowerShell(shellName: string): boolean {
-  return /powershell|pwsh/i.test(shellName)
+interface SystemPart {
+  text: string
+  metadata?: Record<string, unknown>
 }
 
-/**
- * Build the replacement system prompt.
- *
- * Returns exactly one element, like V2: the whole prompt is a single text part
- * (the caller decides where to slot the preserved "title generator" part).
- * Stays `async` even though it does no IO — callers already `await` it, and that
- * keeps the signature stable if a future revision needs a round trip.
- */
-export async function buildRemoteSystemPrompt(
-  ctx: RemotePromptContext,
-  originalSystem: string[]
-): Promise<string[]> {
-  // 1. Model-family prompt (unchanged V2 behaviour).
-  const providerPrompt = getProviderPrompt(ctx.modelID)
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
 
-  // 2. Remote environment block.
-  const shellLine = isPowerShell(ctx.shellName)
-    ? `  Shell: ${ctx.shellName} (use PowerShell syntax; path separators may be /)`
-    : `  Shell: ${ctx.shellName}`
+function instructionSources(part: SystemPart): InstructionSource[] | undefined {
+  const experimental = part.metadata?.experimental
+  if (!record(experimental)) return
+  const sources = experimental.instructions
+  if (!Array.isArray(sources) || !sources.every((source) =>
+    record(source) && typeof source.key === "string" && typeof source.text === "string"
+  )) return
+  return sources
+}
 
-  const envBlock = [
-    `You are powered by the model named ${ctx.modelID}.`,
-    "Here is some useful information about the environment you are running in:",
+function remoteEnvironment(ctx: RemotePromptContext): string {
+  return [
+    "Here is some useful information about the remote environment:",
     "<env>",
     `  Working directory: ${ctx.remoteRoot}`,
     `  Workspace root folder: ${ctx.remoteRoot}`,
     `  Platform: ${ctx.platform}`,
-    shellLine,
+    `  Shell: ${ctx.shellName}`,
     `  Is directory a git repo: ${ctx.isGitRepo ? "yes" : "no"}`,
-    `  Today's date: ${new Date().toDateString()}`,
     "</env>",
-  ].join("\n")
-
-  // 3. Dialect instructions — the paragraph that stops `ls -la` on Windows.
-  const shellHint = ctx.shellHint.trim()
-
-  // 3b. Workspace-reach note. A remote workspace is frequently the login home
-  //     (or a whole drive), and `glob`/`grep` default to walking it from the
-  //     top: over SFTP that burns the traversal budget on unrelated trees. The
-  //     model can do much better with a scoped `path`, and it can reach other
-  //     volumes by absolute path — neither is guessable from the tool schemas.
-  const reachHint = [
-    `All file tools operate on the remote machine (${ctx.remoteRoot}) — there are no local tools in this session.`,
-    `Pass "path" to narrow "glob"/"grep" whenever you know roughly where to look: they walk the workspace root by`,
-    `default, which is slow and gets truncated on large trees (a login home or a whole drive).`,
+    "",
+    "The shell, glob, grep, read, write, edit and patch tools operate on the remote machine.",
+    "Other tools and integrations retain their own execution environments.",
+    "Use the remote environment above for these file and shell tools, including when older conversation",
+    "messages describe the local session directory. Local instruction-file updates do not describe the remote project.",
+    'Pass "path" to narrow "glob"/"grep" when possible: walking the whole remote workspace is slow and may be truncated.',
     ctx.platform === "windows"
-      ? `Any absolute path on the remote is reachable, including other volumes (e.g. 'D:/proj', 'F:/data');`
-      : `Any absolute path on the remote is reachable (e.g. '/srv/data', '/etc').`,
-    `paths outside the workspace may ask for permission.`,
+      ? "Absolute remote paths can reach other volumes (e.g. D:/proj); paths outside the workspace may ask for permission."
+      : "Absolute remote paths can reach outside the workspace (e.g. /srv/data); those paths may ask for permission.",
+    ...(ctx.shellHint.trim() ? ["", ctx.shellHint.trim()] : []),
   ].join("\n")
+}
 
-  // 4. Remote AGENTS.md (already fetched by the caller over SFTP).
-  const agentsMd = (ctx.agentsMd ?? "").trim()
-  const agentsSection =
-    agentsMd === ""
-      ? ""
-      : `Instructions from: ${joinRemoteFileName(ctx.remoteRoot, "AGENTS.md")}\n${agentsMd}`
-
-  // 5. Skills section carried over from the local prompt.
-  const skillsSection = extractSkillsSection(originalSystem)
-
-  const parts: string[] = [providerPrompt, envBlock]
-  if (shellHint !== "") parts.push(shellHint)
-  parts.push(reachHint)
-  if (agentsSection !== "") parts.push(agentsSection)
-  if (skillsSection !== undefined && skillsSection.trim() !== "") parts.push(skillsSection)
-
-  return [parts.join("\n\n")]
+function remoteInstructions(ctx: RemotePromptContext): string {
+  const agents = ctx.agentsMd?.trim()
+  if (!agents) return "No AGENTS.md was loaded from the remote workspace root."
+  const root = ctx.remoteRoot.replace(/[/\\]+$/, "")
+  return `Instructions from: ${root}/AGENTS.md\n${agents}`
 }
 
 /**
- * Skills are appended last by OpenCode, so we search the array from the END —
- * a model/tool description earlier in the prompt could otherwise contain the
- * same sentence and truncate the real section.
+ * Preserve agent/model prompts and all unrelated instruction sources. V2 2.2.7+
+ * exposes source metadata on the joined instructions part. Replace source text
+ * in place instead of rebuilding the entire part, preserving other hooks' edits.
+ * Metadata is a copy, so update it alongside the model-visible text.
+ * Auxiliary requests without instruction sources are left alone.
  */
-function extractSkillsSection(system: string[]): string | undefined {
-  for (let i = system.length - 1; i >= 0; i--) {
-    const text = system[i]
-    if (typeof text !== "string") continue
-    const idx = text.lastIndexOf("Skills provide specialized instructions")
-    if (idx !== -1) return text.slice(idx)
+export function applyRemoteContext(system: SystemPart[], ctx: RemotePromptContext): boolean {
+  let foundEnvironment = false
+  for (const part of system) {
+    const sources = instructionSources(part)
+    if (!sources) continue
+    const replacements = sources.map((source) => {
+      if (source.key === "core/environment") {
+        foundEnvironment = true
+        return { ...source, text: remoteEnvironment(ctx) }
+      }
+      if (source.key === "core/instructions") return { ...source, text: remoteInstructions(ctx) }
+      return source
+    })
+    if (replacements.every((source, index) => source === sources[index])) continue
+    // When there are no local instruction files, core/instructions may be absent.
+    if (sources.some((source) => source.key === "core/environment") &&
+        !sources.some((source) => source.key === "core/instructions")) {
+      const remote = { key: "core/instructions", text: remoteInstructions(ctx) }
+      replacements.push(remote)
+    }
+    const original = sources.map((source) => source.text).join("\n\n")
+    if (!original || !part.text.includes(original)) {
+      throw new Error("Remote Code: instruction source text was changed by another hook")
+    }
+    part.text = part.text.replace(original, () => replacements.map((source) => source.text).join("\n\n"))
+    part.metadata = {
+      ...part.metadata,
+      experimental: {
+        ...(part.metadata!.experimental as Record<string, unknown>),
+        instructions: replacements,
+      },
+    }
   }
-  return undefined
+  return foundEnvironment
 }

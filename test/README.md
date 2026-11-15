@@ -24,6 +24,7 @@ node test/remote-walk.mjs            # 只跑远端遍历/读取的单元断言
 node test/path-mapper.mjs            # 只跑镜像路径映射的单元断言
 node test/ssh-pool-lifecycle.mjs     # 只跑连接池生命周期/泄漏断言
 node test/config-activate.mjs        # 只跑 activateIn 作用域 + 3.0.1 默认值断言
+node test/system-prompt.mjs          # V2 指令来源、agent/skills 保留、远程上下文与幂等性
 ```
 
 - 全部通过时 exit 0，否则 exit 1（`--dialect` 写错也是 1，并打印用法）。

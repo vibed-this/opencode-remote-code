@@ -9,7 +9,7 @@ Remote Code is an OpenCode plugin that lets AI agents operate on remote machines
 1. The remote may now be **Windows** (OpenSSH for Windows, PowerShell 5.1 / 7+) as well as **Linux / macOS**. All platform knowledge lives in `src/platform/`; `src/tools/` contains no platform assumptions at all.
 2. All configuration moved into the plugin's **`options`**. `REMOTE_*` env vars, `--remote*` argv and `sudoPassword` were deleted.
 
-This fork targets **OpenCode V2** (`@opencode/plugin` ^2.1.2). Historical documents: [`MIGRATION-V2.md`](MIGRATION-V2.md) (verified V1→V2 API contract) and [`PORTING-NOTES.md`](PORTING-NOTES.md) (per-file V1→V2 port log). The authoritative design for the V3 refactor is [`DESIGN-V3.md`](DESIGN-V3.md) (Chinese).
+This fork targets **OpenCode 2.2.7+** (`@opencode/plugin` ^2.2.7), requiring keyed instruction-source metadata. Historical documents: [`MIGRATION-V2.md`](MIGRATION-V2.md) (verified V1→V2 API contract) and [`PORTING-NOTES.md`](PORTING-NOTES.md) (per-file V1→V2 port log). The authoritative design for the V3 refactor is [`DESIGN-V3.md`](DESIGN-V3.md) (Chinese).
 
 ## Design Decisions
 
@@ -345,7 +345,7 @@ export default Plugin.define({
 })
 ```
 
-`setup` returning a cleanup function replaces V1's `dispose` / `session.deleted` handler. Tool registration uses `ctx.tool.transform(editor => editor.add(...))`, permissions use `ctx.permission.assert(...)` (via `src/v2-bridge.ts`), and the system prompt is injected with `ctx.session.hook("context", ...)` (`event.system` is an array of `{ type: "text", text }` parts, not `string[]`). A title-only request (a single system part containing "You are a title generator") is left untouched, so generating a title costs no extra SSH round trip.
+`setup` returning a cleanup function replaces V1's `dispose` / `session.deleted` handler. Tool registration uses `ctx.tool.transform(editor => editor.add(...))`, permissions use `ctx.permission.assert(...)` (via `src/v2-bridge.ts`), and remote instruction sources are updated with `context`, `generate`, and `compaction` hooks. System parts retain their metadata and unrelated instructions. The separate V2 `title` hook is not overridden.
 
 ## Key Implementation Details
 
@@ -440,17 +440,15 @@ V1's `ctx.ask({ permission, patterns, always })` does not exist in V2. `src/v2-b
 
 ### System prompt injection
 
-`src/system-prompt.ts` is a **pure string builder** — the caller has already probed the remote and read `<workdir>/AGENTS.md` over SFTP (≤ 256 KiB, skipped if it contains a NUL byte). No `cat`, no `uname`, no `git rev-parse` (`<workdir>/.git` is a SFTP `stat`).
+`src/system-prompt.ts` edits **keyed instruction sources without IO** — the caller has already probed the remote and read `<workdir>/AGENTS.md` over SFTP (≤ 256 KiB, skipped if it contains a NUL byte). No `cat`, no `uname`, no `git rev-parse` (`<workdir>/.git` is a SFTP `stat`). It preserves upstream model prompts and custom agents, replacing only `core/environment` and `core/instructions` using `metadata.experimental.instructions`. The latter replaces all local discovered/configured instruction files, including global files, with the remote root `AGENTS.md`. Shared policies belong in custom agent instructions. No remote nested discovery is performed.
 
 ```
-You are powered by the model named …
 <env>
   Working directory: C:/Users/zhouxiaokang/proj
   Workspace root folder: C:/Users/zhouxiaokang/proj
   Platform: windows
-  Shell: PowerShell 5.1 (use PowerShell syntax; path separators may be /)
+  Shell: PowerShell 5.1
   Is directory a git repo: yes
-  Today's date: …
 </env>
 ```
 
@@ -462,7 +460,7 @@ Select-String, Test-Path, New-Item); `&&` is unavailable, use `;` to chain comma
 Quote paths with single quotes. Paths may use forward slashes.
 ```
 
-The model's skills section is preserved by searching the system parts from the end (`Skills provide specialized instructions…`), because a tool description earlier in the prompt could contain the same sentence.
+Skills, Code Mode, MCP guidance, date and session entries are preserved by source key, not by text-heading heuristics. Source metadata is updated together with model-visible text. Stored history is unchanged; older local instruction updates may remain, so the remote context explicitly distinguishes them. Requests without the expected metadata are unsupported for the main agent loop. Auxiliary requests without instruction sources are left alone. There are no bundled model templates or prompt-copy build step.
 
 ### Concurrency
 
@@ -483,7 +481,7 @@ The model's skills section is preserved by searching the system parts from the e
 ## Technology Stack
 
 - **Runtime**: Node.js / Bun (OpenCode runs on Bun; the plugin uses standard `fs`/`crypto`)
-- **Plugin API**: `@opencode/plugin` ^2.1.2 (peer dependency)
+- **Plugin API**: `@opencode/plugin` ^2.2.7 (peer dependency)
 - **SSH/SFTP**: `ssh2` (pure Node.js; bundled) — the only transport, in both directions
 - **Diff**: `diff` (unified diff previews for `write`/`edit`/`patch`)
 - **Language**: TypeScript
@@ -517,7 +515,7 @@ npm install
 npm run build
 ```
 
-`npm run build` runs `tsc` and then `scripts/postbuild.cjs`, which copies `src/prompts/*.txt` into `dist/prompts/` (the runtime loads prompt fragments from there, so a bare `tsc` is not enough).
+`npm run build` cleans stale `dist/` output and compiles TypeScript. There are no runtime prompt assets to copy.
 
 ### Install
 

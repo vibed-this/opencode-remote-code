@@ -19,7 +19,7 @@ import { createReadTool } from "./tools/read.js"
 import { createShellTool } from "./tools/shell.js"
 import { createWriteTool } from "./tools/write.js"
 import type { RemoteToolContext } from "./tools/context.js"
-import { buildRemoteSystemPrompt } from "./system-prompt.js"
+import { applyRemoteContext, type RemotePromptContext } from "./system-prompt.js"
 import {
   createPermissionGateway,
   type PluginContext,
@@ -80,6 +80,7 @@ export default Plugin.define({
     //    "is this Windows?" and "what is the login home?".
     // ---------------------------------------------------------------------
     let sshPool: SSHPool | undefined
+    const registrations: Array<{ dispose(): Promise<void> }> = []
     try {
       sshPool = await createSSHPool(config)
 
@@ -167,10 +168,11 @@ export default Plugin.define({
       const toolRegistration = await ctx.tool.transform((editor) => {
         for (const tool of tools) editor.add(tool)
       })
+      registrations.push(toolRegistration)
       await logger.log(`registered tools: ${tools.map((t) => t.name).join(", ")}`)
 
       // ---------------------------------------------------------------------
-      // 4. System prompt replacement (V2 "context" hook). Every remote read
+      // 4. Remote instruction sources. Every remote read
       //    happens once, here, and is cached for the session.
       // ---------------------------------------------------------------------
       const agentsPath = detected.pathOps.join(detected.workdir, "AGENTS.md")
@@ -194,49 +196,29 @@ export default Plugin.define({
         `prompt context: git=${isGitRepo} agentsMd=${agentsMd ? "yes" : "no"} shell=${dialect.shellName}`
       )
 
-      const hookRegistration = await ctx.session.hook("context", async (event) => {
-        const current = event.system.map((part) => part.text)
-        const titleGeneratorIdx = current.findIndex((text) =>
-          text.includes("You are a title generator")
-        )
-
-        // Auxiliary title-generation requests carry only the title prompt;
-        // leave them untouched (they never call tools).
-        if (titleGeneratorIdx !== -1 && event.system.length === 1) return
-
-        const remoteSystem = await buildRemoteSystemPrompt(
-          {
-            modelID: event.model?.id ? String(event.model.id) : "default",
-            remoteRoot: detected.workdir,
-            platform: detected.kind,
-            shellName: dialect.shellName,
-            shellHint: dialect.promptHint(),
-            isGitRepo,
-            agentsMd,
-          },
-          current
-        )
-
-        if (titleGeneratorIdx !== -1) {
-          // Preserve the title generator, replace everything else.
-          const titleGenerator = event.system[titleGeneratorIdx]
-          event.system.length = 0
-          event.system.push(titleGenerator, ...remoteSystem.map(toSystemPart))
-        } else {
-          event.system.length = 0
-          event.system.push(...remoteSystem.map(toSystemPart))
-        }
-
-        await logger.log(`context hook done. system parts=${event.system.length}`)
-      })
+      const remoteContext: RemotePromptContext = {
+        remoteRoot: detected.workdir,
+        platform: detected.kind,
+        shellName: dialect.shellName,
+        shellHint: dialect.promptHint(),
+        isGitRepo,
+        agentsMd,
+      }
+      for (const name of ["context", "generate", "compaction"] as const) {
+        registrations.push(await ctx.session.hook(name, (event) => {
+          const applied = applyRemoteContext(event.system, remoteContext)
+          if (name === "context" && !applied) {
+            throw new Error("Remote Code requires OpenCode 2.2.7+ instruction-source metadata (core/environment)")
+          }
+        }))
+      }
 
       // ---------------------------------------------------------------------
       // 5. Cleanup (replaces V1's `session.deleted` handler).
       // ---------------------------------------------------------------------
       return async () => {
         await logger.log("Plugin cleanup: saving manifest and closing SSH pool")
-        await hookRegistration.dispose().catch(() => {})
-        await toolRegistration.dispose().catch(() => {})
+        for (const registration of registrations.slice().reverse()) await registration.dispose().catch(() => {})
         await manifest.save().catch(() => {})
         await sshPool?.close().catch(() => {})
       }
@@ -245,15 +227,12 @@ export default Plugin.define({
       // half-wired plugin behind, and never take OpenCode down with us.
       console.error(`[remote-code] setup failed: ${(error as Error).message}`)
       await logger.log(`setup failed: ${(error as Error).message}`)
+      for (const registration of registrations.slice().reverse()) await registration.dispose().catch(() => {})
       await sshPool?.close().catch(() => {})
       return
     }
   },
 })
-
-function toSystemPart(text: string): { type: "text"; text: string } {
-  return { type: "text", text }
-}
 
 /** `realpath` over a pooled SFTP session — the probe detection needs first. */
 function sftpRealpath(pool: SSHPool, remotePath: string): Promise<string> {

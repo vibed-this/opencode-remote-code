@@ -63,6 +63,7 @@ function makeMockContext({ port, user, password }) {
   const projectDir = process.cwd()
   const added = []
   const notes = []
+  const hooks = new Map()
 
   const editor = {
     add: (tool) => {
@@ -108,9 +109,10 @@ function makeMockContext({ port, user, password }) {
       },
     },
     session: {
-      hook: async (name) => {
+      hook: async (name, callback) => {
         notes.push(`session.hook(${typeof name === "string" ? name : "?"})`)
-        return { dispose: async () => {} }
+        hooks.set(name, callback)
+        return { dispose: async () => { hooks.delete(name) } }
       },
     },
     event: {
@@ -127,7 +129,7 @@ function makeMockContext({ port, user, password }) {
     },
   }
 
-  return { ctx, added, notes }
+  return { ctx, added, notes, hooks }
 }
 
 /**
@@ -184,7 +186,7 @@ export async function runPluginSmoke(opts) {
 
   /* ------------------------------ setup --------------------------------- */
 
-  const { ctx, added, notes } = makeMockContext({ port, user, password })
+  const { ctx, added, notes, hooks } = makeMockContext({ port, user, password })
 
   // Env fallbacks, in case the ported plugin still reads process.env.
   const savedEnv = {
@@ -217,6 +219,30 @@ export async function runPluginSmoke(opts) {
   }
 
   /* ------------------------------ tools --------------------------------- */
+
+  for (const name of ["context", "generate", "compaction"]) {
+    try {
+      const hook = hooks.get(name)
+      if (!hook) throw new Error(`missing ${name} hook`)
+      const agent = { type: "text", text: "Custom agent instructions" }
+      const event = {
+        system: [agent, {
+          type: "text", text: "Local workspace",
+          metadata: { experimental: { instructions: [{ key: "core/environment", text: "Local workspace" }] } },
+        }],
+        messages: [{ role: "user", content: [{ type: "text", text: "Keep this message" }] }],
+      }
+      const messages = JSON.stringify(event.messages)
+      await hook(event)
+      if (event.system[0] !== agent || event.system[0].text !== "Custom agent instructions") throw new Error("agent prompt changed")
+      if (!event.system[1].text.includes("Working directory: /") || event.system[1].text.includes("Local workspace")) throw new Error("remote environment not substituted")
+      if (JSON.stringify(event.messages) !== messages) throw new Error("messages changed")
+      record(`${name} hook preserves agent and messages, replaces environment`, "pass")
+    } catch (err) {
+      record(`${name} hook preserves agent and messages, replaces environment`, "fail", err.message)
+    }
+  }
+  record("title hook is not overridden", hooks.has("title") ? "fail" : "pass")
 
   record(
     "tool.transform registers tools",

@@ -20,21 +20,20 @@
     "index.js"
   ],
   "scripts": {
-    "build": "tsc",
-    "postbuild": "node scripts/postbuild.cjs",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc",
     "dev": "tsc --watch",
     "lint": "tsc --noEmit",
     "test": "node test/run-tests.mjs"
   },
   "peerDependencies": {
-    "@opencode/plugin": "^2.1.2"
+    "@opencode/plugin": "^2.2.7"
   },
   "dependencies": {
     "diff": "^9.0.0",
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
-    "@opencode/plugin": "^2.1.2",
+    "@opencode/plugin": "^2.2.7",
     "@types/node": "^20.0.0",
     "@types/ssh2": "^1.15.5",
     "typescript": "^5.4.0"
